@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Send vulnerability reports to **security@setix.ai**.
+Send vulnerability reports to **security@setix.com**.
 
 We follow coordinated disclosure: 90 days standard, 30 days when a working proof-of-concept is provided. We acknowledge reports within two business days and aim to publish a fix and advisory within the disclosure window.
 
