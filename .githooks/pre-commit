@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# pre-commit — three independent fail-closed layers.
+#
+#   Layer 1 — secret-shape scan (self-contained; PEM/AWS/Solana-keypair/PAT/etc.)
+#   Layer 2 — source-leakage scan (catches protocol-internal field names that
+#             should never appear in publishable client code)
+#   Layer 3 — public-clean discipline (catches internal vocabulary in the
+#             staged commit message + staged file content)
+#
+# Bypass via --no-verify is against project rules. Each layer exits non-zero
+# on a hit; nothing here ever silently passes.
+
+set -euo pipefail
+
+# ── Layer 1: secret-shape scan ───────────────────────────────────────────────
+#
+# Inline patterns. The repo never contains the literal patterns it scans for,
+# so the rules live inline rather than off-drive.
+
+SECRET_PATTERNS=(
+    '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    '-----BEGIN OPENSSH PRIVATE KEY-----'
+    'AKIA[0-9A-Z]{16}'
+    'ASIA[0-9A-Z]{16}'
+    'AGPA[0-9A-Z]{16}'
+    'ghp_[A-Za-z0-9]{36,}'
+    'github_pat_[A-Za-z0-9_]{80,}'
+    'gho_[A-Za-z0-9]{36,}'
+    'glpat-[A-Za-z0-9_-]{20,}'
+    'xox[abprs]-[0-9A-Za-z-]{10,}'
+    'sk-[A-Za-z0-9]{32,}'
+    'sk-ant-[A-Za-z0-9_-]{32,}'
+    '\[[ ]*[0-9]{1,3},[ ]*[0-9]{1,3},[ ]*[0-9]{1,3},[ ]*[0-9]{1,3}(,[ ]*[0-9]{1,3}){60}'
+    '"private_key":[ ]*"-----BEGIN'
+    'op://[A-Za-z0-9 _-]+/[A-Za-z0-9 _-]+'
+)
+
+SECRET_PATTERN=$(IFS='|'; echo "${SECRET_PATTERNS[*]}")
+
+SCAN_PATHS=$(git diff --cached --name-only --diff-filter=ACMR || true)
+
+if [ -n "$SCAN_PATHS" ]; then
+    SECRET_HITS=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # The hook file contains the rule definitions by construction; scanning
+        # it would self-match. Layer 2 + 3 use the same exemption.
+        case "$f" in
+            .githooks/pre-commit) continue ;;
+        esac
+        diff_chunk=$(git diff --cached -U0 -- "$f" | grep -E '^\+' | grep -v '^+++ ' || true)
+        [ -z "$diff_chunk" ] && continue
+        # Allow inline marker for legitimate matches (e.g. a regex literal).
+        filtered=$(echo "$diff_chunk" | grep -v 'pre-commit-secret-pattern-allow' || true)
+        [ -z "$filtered" ] && continue
+        file_hits=$(echo "$filtered" | grep -iEe "$SECRET_PATTERN" || true)
+        if [ -n "$file_hits" ]; then
+            SECRET_HITS="${SECRET_HITS}--- ${f} ---
+${file_hits}
+"
+        fi
+    done <<< "$SCAN_PATHS"
+
+    if [ -n "$SECRET_HITS" ]; then
+        echo "pre-commit: layer 1 — secret-shape pattern detected in staged diff:" >&2
+        echo "$SECRET_HITS" | head -40 >&2
+        echo "" >&2
+        echo "pre-commit: legitimate matches must add the inline marker:" >&2
+        echo "  # pre-commit-secret-pattern-allow: <one-line reason>" >&2
+        echo "pre-commit: commit BLOCKED (exit 1)" >&2
+        exit 1
+    fi
+fi
+
+# ── Layer 2: source-leakage scan ─────────────────────────────────────────────
+#
+# Protocol-internal field names that must never appear in client code. The
+# canonical source is the monorepo's M5 audit; this is the same rule set
+# applied to staged content in this repo.
+
+LEAK_PATTERNS=(
+    '"secret_key_hex"[ ]*:'
+    'DOC_OFFER\b'
+    'DOC_BID\b'
+    'DOC_ACCEPTANCE\b'
+    'DOC_DELIVERY\b'
+    'DOC_INTENT\b'
+    'DOC_WORKFLOW\b'
+)
+
+LEAK_PATTERN=$(IFS='|'; echo "${LEAK_PATTERNS[*]}")
+
+if [ -n "$SCAN_PATHS" ]; then
+    LEAK_HITS=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        diff_chunk=$(git diff --cached -U0 -- "$f" | grep -E '^\+' | grep -v '^+++ ' || true)
+        [ -z "$diff_chunk" ] && continue
+        # The hook itself contains these patterns by definition — skip itself.
+        case "$f" in
+            .githooks/pre-commit) continue ;;
+        esac
+        file_hits=$(echo "$diff_chunk" | grep -Ee "$LEAK_PATTERN" || true)
+        if [ -n "$file_hits" ]; then
+            LEAK_HITS="${LEAK_HITS}--- ${f} ---
+${file_hits}
+"
+        fi
+    done <<< "$SCAN_PATHS"
+
+    if [ -n "$LEAK_HITS" ]; then
+        echo "pre-commit: layer 2 — protocol-internal field name detected in staged diff:" >&2
+        echo "$LEAK_HITS" | head -40 >&2
+        echo "" >&2
+        echo "pre-commit: client code must not transmit secret keys or use" >&2
+        echo "  internal document-tag constants. See README §Release integrity." >&2
+        echo "pre-commit: commit BLOCKED (exit 2)" >&2
+        exit 2
+    fi
+fi
+
+# ── Layer 3: public-clean discipline ─────────────────────────────────────────
+#
+# Repo vocabulary discipline. Catches forbidden vocabulary in (a) the staged
+# commit message and (b) staged file content. The hook itself is exempt from
+# the file-content scan because it documents the vocabulary it bans.
+
+FORBIDDEN_VOCAB='Co-Authored-By|setix-v0\.[0-9]|Phase [A-J]\.[0-9]|Sub-phase|ADR-2026-0[0-9]+|ADR-0[0-9]+|visa-class|BridgeLocalCustodyProvider|CmekPgBackend|GcpKmsEncrypter|cmek-pg|agent_custody_keys|BRIDGEABLE_TOOLS|HIGH_LEVEL_TOOLS|intent-workflow nonce|build_doc|build-mainnet|strict-dce|promote/devnet|milestone-tag\.sh|sync-setix-sdk\.sh|bridge-as-mailroom|chunk close|chunk scope|dispatch|dev session|supervisor|the monorepo|setix monorepo|synced from monorepo|main repo'
+
+# (a) Commit message check — read the prepared message file. Path is supplied
+# by git via the commit-msg flow, but on the pre-commit hook we approximate
+# by reading whatever the user has already staged in COMMIT_EDITMSG, which
+# git writes BEFORE invoking the editor on `git commit -m "..."`.
+COMMIT_MSG_FILE="$(git rev-parse --git-dir)/COMMIT_EDITMSG"
+if [ -r "$COMMIT_MSG_FILE" ]; then
+    msg_hits=$(grep -iE "$FORBIDDEN_VOCAB" "$COMMIT_MSG_FILE" || true)
+    if [ -n "$msg_hits" ]; then
+        echo "pre-commit: layer 3 — forbidden vocabulary in commit message:" >&2
+        echo "$msg_hits" >&2
+        echo "" >&2
+        echo "pre-commit: rewrite the message in public-clean voice (this repo's" >&2
+        echo "  full history is publishable; internal phase/ADR/substrate references" >&2
+        echo "  must not appear)." >&2
+        echo "pre-commit: commit BLOCKED (exit 3a)" >&2
+        exit 3
+    fi
+fi
+
+# (b) Staged file content check.
+#
+# Applies to human-authored meta files only (README, SECURITY.md, .gitignore,
+# package.json, pyproject.toml, .sync-manifest.json, etc.). The synced client
+# source files are bytes from an upstream source — they have their own audit
+# gate (Layer 2 secret-shape + Layer 2 source-leakage) and vocabulary
+# scrubbing of source comments is handled by upstream cleanup, not here.
+if [ -n "$SCAN_PATHS" ]; then
+    VOCAB_HITS=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+            .githooks/pre-commit)                          continue ;;
+            LICENSE)                                       continue ;;
+            typescript/src/setix-thread.ts)                continue ;;
+            typescript/src/chain-tx-encoders.ts)           continue ;;
+            python/setix_thread/__init__.py)               continue ;;
+            python/setix_thread/chain_tx_encoders.py)      continue ;;
+        esac
+        diff_chunk=$(git diff --cached -U0 -- "$f" | grep -E '^\+' | grep -v '^+++ ' || true)
+        [ -z "$diff_chunk" ] && continue
+        file_hits=$(echo "$diff_chunk" | grep -iEe "$FORBIDDEN_VOCAB" || true)
+        if [ -n "$file_hits" ]; then
+            VOCAB_HITS="${VOCAB_HITS}--- ${f} ---
+${file_hits}
+"
+        fi
+    done <<< "$SCAN_PATHS"
+
+    if [ -n "$VOCAB_HITS" ]; then
+        echo "pre-commit: layer 3 — forbidden vocabulary in staged file content:" >&2
+        echo "$VOCAB_HITS" | head -40 >&2
+        echo "" >&2
+        echo "pre-commit: rewrite in public-clean voice. Acceptable references:" >&2
+        echo "  this repo, https://thread.setix.ai, https://setix.ai/.well-known/sdk-integrity.json" >&2
+        echo "pre-commit: commit BLOCKED (exit 3b)" >&2
+        exit 3
+    fi
+fi
+
+exit 0
