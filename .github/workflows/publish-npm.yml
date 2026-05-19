@@ -1,0 +1,42 @@
+name: publish-npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public'
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        run: npm ci || npm install
+      - name: Build
+        run: npm run build
+      - name: Verify package version matches tag
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          pkg_ver=$(node -p "require('./package.json').version")
+          if [ "$tag_ver" != "$pkg_ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg_ver"
+            exit 1
+          fi
+      - name: Publish (provenance + public access)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

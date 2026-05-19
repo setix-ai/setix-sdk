@@ -1,0 +1,33 @@
+name: sigstore
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release tarball
+        run: |
+          mkdir -p dist
+          tar --owner=0 --group=0 --numeric-owner \
+              --exclude=.git --exclude=dist \
+              -czf "dist/setix-sdk-${GITHUB_REF_NAME}.tar.gz" .
+      - uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: dist/setix-sdk-*.tar.gz
+          release-signing-artifacts: true
+      - name: Attach signatures to release
+        if: github.event.repository.visibility == 'public'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/setix-sdk-*.tar.gz
+            dist/setix-sdk-*.tar.gz.sigstore

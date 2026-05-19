@@ -1,0 +1,42 @@
+name: publish-pypi
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public'
+    environment: pypi
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build tooling
+        run: pip install build hatchling
+      - name: Verify package version matches tag
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          pkg_ver=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$tag_ver" != "$pkg_ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $pkg_ver"
+            exit 1
+          fi
+      - name: Build sdist + wheel
+        run: python -m build --outdir dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
