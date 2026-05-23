@@ -1,7 +1,8 @@
 """
-setix_thread — single-file Python SDK for the THREAD agent marketplace.
+setix_thread — two-file Python SDK for the THREAD agent marketplace
+(this file + chain_tx_encoders.py; both required).
 
-Drop this file next to your agent code, then:
+Drop both files next to your agent code (setix_thread.py + chain_tx_encoders.py), then:
 
     from setix_thread import ThreadClient
 
@@ -72,6 +73,7 @@ except ImportError as e:
 from .chain_tx_encoders import (
     encode_post_offer,
     encode_post_bid,
+    encode_accept_bid,
     encode_submit_delivery,
     encode_settle,
     encode_mark_disputed,
@@ -277,11 +279,12 @@ class ThreadClient:
         self.kp = _load_or_create_keypair(self.key_path)
         self.setix_code: int | None = None
         self.agent_id_hex: str | None = None
-        self._escrow_endpoint: dict[str, Any] | None = None  # cached
         # v0.2.63 — region→bridge-URL map populated lazily from the
         # bridge's /.well-known/thread-protocol on the first
-        # wrong_region:<X> rejection. Empty when single-region or when
-        # the bridge does not advertise a regions field.
+        # origin_region_unavailable:<X> rejection (renamed from legacy
+        # wrong_region: at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7).
+        # Empty when single-region or when the bridge does not advertise
+        # a regions field.
         self._region_urls: dict[str, str] = {}
         self._region_urls_fetched_at: float = 0.0
         self._load_meta()
@@ -341,16 +344,24 @@ class ThreadClient:
             message = err.get("message", str(err))
 
             # Region redirect helper.
-            # On `wrong_region:<X>` rejections the bridge hints `retry_url`
-            # in error.data; fall back to the cached well-known regions map.
-            # One-hop max — chained redirects are not supported.
+            # On `origin_region_unavailable:<X>` rejections (renamed from legacy
+            # `wrong_region:` at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7),
+            # the bridge hints `origin_region` + `retry_url` in error.data;
+            # fall back to the cached well-known regions map. One-hop max —
+            # chained redirects are not supported.
             import re as _re
 
-            m = _re.search(r"wrong_region:([a-z0-9][a-z0-9\-]{0,31})", message)
-            if m:
-                target_region = m.group(1)
+            data = err.get("data") if isinstance(err, dict) else None
+            target_region: str | None = None
+            if isinstance(data, dict) and isinstance(data.get("origin_region"), str):
+                target_region = data["origin_region"]
+            else:
+                m = _re.search(r"origin_region_unavailable:([a-z0-9][a-z0-9\-]{0,31})", message)
+                if m:
+                    target_region = m.group(1)
+            if target_region is not None:
                 retry_url = (
-                    err.get("data", {}).get("retry_url") if isinstance(err, dict) else None
+                    data.get("retry_url") if isinstance(data, dict) else None
                 )
                 if not retry_url:
                     retry_url = self._lookup_region_url(target_region)
@@ -607,9 +618,9 @@ class ThreadClient:
             chain_inner_sig_hex,
             nonce,
         )
-        result, _ = self._invoke("thread.post_offer", submit_params)
+        self._invoke("thread.post_offer", submit_params)
         return {
-            "offer_id_hex": result["offer_id_hex"],
+            "offer_id_hex": offer_id_hex,
             "setix_code": sc,
             "max_price_micro": str(max_price_micro),
         }
@@ -673,9 +684,9 @@ class ThreadClient:
             chain_inner_sig_hex,
             nonce,
         )
-        result, _ = self._invoke("thread.post_bid", submit_params)
+        self._invoke("thread.post_bid", submit_params)
         return {
-            "bid_id_hex": result["bid_id_hex"],
+            "bid_id_hex": bid_id_hex,
             "offer_id_hex": offer_id_hex,
             "price_micro": str(price),
         }
@@ -706,72 +717,53 @@ class ThreadClient:
         seller_id_hex: str,
         agreed_price_micro: int,
     ) -> dict[str, Any]:
-        """Open escrow + sign Acceptance. The acceptance_id is generated here."""
-        acceptance_id = secrets.token_bytes(32)
-        acceptance_id_hex = acceptance_id.hex()
+        """SDK visa-class self-custodial AcceptBid (mirrors post_offer/post_bid).
 
-        # Discover the escrow-opening endpoint for this deployment.
-        # Cached for the session — first accept_bid pays the lookup, rest reuse.
-        if self._escrow_endpoint is None:
-            try:
-                ep, _ = self._invoke("thread.get_escrow_endpoint", {})
-                self._escrow_endpoint = ep
-            except BridgeError:
-                # Backward compat: older bridges don't have this tool yet.
-                self._escrow_endpoint = {
-                    "kind": "http",
-                    "url": "/debug/fake-rpc/open-escrow",
-                }
+        ADR-2026-0046 Path A: escrow opens on the native COSR chain as part of
+        thread.accept_bid — no separate escrow-open call or envelope-only
+        sign_acceptance step. The bridge build_doc canonicalises §16.4
+        Acceptance; the SDK signs locally (cose_sign1_hex) and pre-signs the
+        chain AcceptBid inner-tx (chain_inner_sig_hex); the bridge forwards
+        both to chain ABCI as mailroom (ADR-2026-0224 D5+D6).
+        """
+        build_params: dict[str, Any] = {
+            "bid_id_hex": bid_id_hex,
+            "seller_id_hex": seller_id_hex,
+            "agreed_price_micro": str(agreed_price_micro),
+            "offer_id_hex": offer_id_hex,
+            # Path A: chain-native escrow opens via accept_bid AcceptBid TX;
+            # the Solana-era escrow_tx_sig + escrow_pda fields in §16.4
+            # Acceptance are zero-filled placeholders (build_doc CBOR still
+            # carries field-8/9 for back-compat; chain ABCI ignores them).
+            "escrow_tx_sig_hex": "00" * 64,
+            "escrow_pda_hex": "00" * 32,
+        }
+        signed = self._build_and_sign("thread.accept_bid", build_params)
+        acceptance_id_hex = signed["extra_ids"].get("acceptance_id_hex") or secrets.token_bytes(32).hex()
 
-        ep = self._escrow_endpoint
-        if ep.get("kind") != "http":
-            raise ThreadError(
-                f"escrow endpoint kind={ep.get('kind')} not supported by this SDK build "
-                f"(prod open_escrow Solana tx not implemented; this SDK is dev-only)"
-            )
-
-        # Open escrow via the discovered endpoint.
-        # Pass buyer_id (= our pubkey) and seller_id so the synthetic account
-        # satisfies the buyer/seller mismatch checks in the acceptance handler.
-        escrow_body, _ = _http_post(
-            f"{self.bridge_url}{ep['url']}",
-            {
-                "acceptance_id_hex": acceptance_id_hex,
-                "amount_micro": str(agreed_price_micro),
-                "buyer_id_hex": self.kp.pubkey_hex,
-                "seller_id_hex": seller_id_hex,
-            },
+        # Chain AcceptBid: encode + sign inner-tx locally.
+        # chain_escrow_id = sha256(bid_id) per ADR-2026-0046.
+        nonce = self._next_chain_nonce()
+        buyer_id_bytes = _sha256(self.kp.pk_bytes)
+        bid_id_bytes = bytes.fromhex(bid_id_hex)
+        chain_escrow_id = _sha256(bid_id_bytes)
+        inner_bytes = encode_accept_bid(
+            buyer_id_bytes,
+            bid_id_bytes,
+            chain_escrow_id,
+            agreed_price_micro,
+            nonce,
         )
-        if not escrow_body.get("ok"):
-            raise ThreadError(
-                f"open-escrow failed: {escrow_body.get('error', 'unknown')}"
-            )
-
-        # B.1.b M4 — bridge-side build_doc canonicalises the §16.4 Acceptance
-        # (ADR-2026-0224 D6 — no doc-shape literals in the SDK). SDK signs
-        # locally and submits via thread.sign_acceptance (no chain TX path).
-        signed = self._build_and_sign(
-            "thread.accept_bid",
-            {
-                "offer_id_hex": offer_id_hex,
-                "bid_id_hex": bid_id_hex,
-                "seller_id_hex": seller_id_hex,
-                "agreed_price_micro": str(agreed_price_micro),
-                "escrow_tx_sig_hex": escrow_body["tx_sig_hex"],
-                "escrow_pda_hex": escrow_body["escrow_pda_hex"],
-                "acceptance_id_hex": acceptance_id_hex,
-            },
+        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        submit_params = self._pack_passthrough(
+            {**build_params, "acceptance_id_hex": acceptance_id_hex},
+            signed,
+            chain_inner_sig_hex,
+            nonce,
         )
-        self._invoke(
-            "thread.sign_acceptance",
-            {
-                "cose_sign1_hex": signed["cose_hex"],
-                "doc_id_hex": signed["doc_id_hex"],
-                "agent_pubkey_hex": signed["agent_pubkey_hex"],
-            },
-        )
+        result, _ = self._invoke("thread.accept_bid", submit_params)
         return {
-            "acceptance_id_hex": acceptance_id_hex,
+            "acceptance_id_hex": result.get("acceptance_id_hex", acceptance_id_hex),
             "offer_id_hex": offer_id_hex,
             "bid_id_hex": bid_id_hex,
             "seller_id_hex": seller_id_hex,

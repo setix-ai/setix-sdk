@@ -1,7 +1,8 @@
 /**
- * setix-thread — single-file TypeScript SDK for the THREAD agent marketplace.
+ * setix-thread — two-file TypeScript SDK for the THREAD agent marketplace
+ * (this file + chain-tx-encoders.ts; both required).
  *
- * Drop into your Node 18+ project, then:
+ * Drop both files into your Node 18+ project (setix-thread.ts + chain-tx-encoders.ts), then:
  *
  *   import { ThreadClient } from './setix-thread.js';
  *
@@ -67,6 +68,7 @@ import { ed25519 } from '@noble/curves/ed25519';
 import {
     encodePostOffer,
     encodePostBid,
+    encodeAcceptBid,
     encodeSubmitDelivery,
     encodeSettle,
     encodeMarkDisputed,
@@ -263,12 +265,13 @@ export class ThreadClient {
     readonly kp: Keypair;
     setixCode: number | null = null;
     agentIdHex: string | null = null;
-    private escrowEndpoint: Record<string, unknown> | null = null;
     /** Cached region→bridge-URL map pulled from /.well-known/thread-protocol.
-     * Populated lazily on the first wrong_region:<X> rejection (or via a manual
-     * refresh hint). The bridge has 1h Cache-Control on /.well-known; in-process
-     * TTL of 60s — short enough to pick up topology changes within a swarm-test
-     * run, long enough to amortize the GET. */
+     * Populated lazily on the first origin_region_unavailable:<X> rejection
+     * (renamed from legacy wrong_region: at B.3 M1 / setix-v0.2.352, per
+     * ADR-2026-0222 D6+D7), or via a manual refresh hint. The bridge has 1h
+     * Cache-Control on /.well-known; in-process TTL of 60s — short enough to
+     * pick up topology changes within a swarm-test run, long enough to
+     * amortize the GET. */
     private regionUrls: Map<string, string> = new Map();
     private regionUrlsFetchedAt: number = 0;
     private static readonly REGION_CACHE_TTL_MS = 60_000;
@@ -339,18 +342,27 @@ export class ThreadClient {
             const err = body['error'] as {
                 code?: number;
                 message?: string;
-                data?: { retry_url?: string };
+                data?: {
+                    retry_url?: string;
+                    // B.3 M1 (setix-v0.2.352) §19.6.5 contract per ADR-2026-0222 D7.
+                    protocol_error_code?: string;
+                    origin_region?: string;
+                    retry_after_slots?: number | null;
+                    healthy_regions?: string[];
+                };
             };
             const message = err.message ?? JSON.stringify(err);
 
             // Region redirect helper.
-            // On `wrong_region:<X>` rejections the bridge hints `retry_url`
-            // in error.data; we also fall back to the cached well-known
-            // regions map. One-hop max — if the retried bridge also rejects,
-            // surface that error directly (no chained redirect).
-            const m = message.match(/wrong_region:([a-z0-9][a-z0-9\-]{0,31})/);
-            if (m) {
-                const targetRegion = m[1]!;
+            // On `origin_region_unavailable:<X>` rejections (renamed from legacy
+            // `wrong_region:` at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7),
+            // the bridge hints `origin_region` + `retry_url` in error.data; we
+            // also fall back to the cached well-known regions map. One-hop max —
+            // if the retried bridge also rejects, surface that error directly
+            // (no chained redirect).
+            const targetRegion = err.data?.origin_region
+                ?? message.match(/origin_region_unavailable:([a-z0-9][a-z0-9\-]{0,31})/)?.[1];
+            if (targetRegion) {
                 let retryUrl = err.data?.retry_url;
                 if (!retryUrl) {
                     const looked = await this.lookupRegionUrl(targetRegion);
@@ -604,8 +616,8 @@ export class ThreadClient {
             chainInnerSigHex,
             nonce,
         });
-        const { result } = await this.invoke('thread.post_offer', submitParams);
-        return { offerIdHex: (result as { offer_id_hex: string }).offer_id_hex };
+        await this.invoke('thread.post_offer', submitParams);
+        return { offerIdHex };
     }
 
     async queryOffers(args: { setixCode?: number; maxResults?: number } = {}): Promise<Record<string, unknown>[]> {
@@ -662,8 +674,8 @@ export class ThreadClient {
             chainInnerSigHex,
             nonce,
         });
-        const { result } = await this.invoke('thread.post_bid', submitParams);
-        return { bidIdHex: (result as { bid_id_hex: string }).bid_id_hex };
+        await this.invoke('thread.post_bid', submitParams);
+        return { bidIdHex };
     }
 
     async queryBids(offerIdHex: string): Promise<Record<string, unknown>[]> {
@@ -685,61 +697,57 @@ export class ThreadClient {
     async acceptBid(args: {
         offerIdHex: string; bidIdHex: string; sellerIdHex: string; agreedPriceMicro: bigint;
     }): Promise<{ acceptanceIdHex: string }> {
-        // B.1.b M3 — SDK self-custodial: bridge-side `thread.build_doc`
-        // canonicalises the §16.4 Acceptance doc (ADR-2026-0224 D6 — no
-        // doc-shape literals in the SDK). The SDK ed25519-signs the
-        // returned canonical bytes locally and submits `cose_sign1_hex` to
-        // `thread.sign_acceptance` (envelope-only endpoint, no chain TX).
-
-        // Discover the escrow-opening endpoint for this deployment.
-        if (this.escrowEndpoint === null) {
-            try {
-                const { result } = await this.invoke('thread.get_escrow_endpoint', {});
-                this.escrowEndpoint = result as Record<string, unknown>;
-            } catch {
-                this.escrowEndpoint = { kind: 'http', url: '/debug/fake-rpc/open-escrow' };
-            }
-        }
-        const ep = this.escrowEndpoint;
-        if (ep['kind'] !== 'http') {
-            throw new ThreadError(
-                `escrow endpoint kind=${String(ep['kind'])} not supported by this SDK build`
-            );
-        }
-
-        // Pre-generate an acceptance_id so the escrow + bridge build_doc see the same value.
-        const acceptanceId = rand(32);
-        const acceptanceIdHex = Buffer.from(acceptanceId).toString('hex');
-
-        // Open escrow via the discovered endpoint.
-        const escrowRes = await httpPost(this.bridgeUrl, ep['url'] as string, {
-            acceptance_id_hex: acceptanceIdHex,
-            amount_micro: args.agreedPriceMicro.toString(),
-            buyer_id_hex: this.kp.pubkeyHex,
-            seller_id_hex: args.sellerIdHex,
-        });
-        const escrow = escrowRes.body as {
-            ok?: boolean; escrow_pda_hex?: string; tx_sig_hex?: string; error?: string;
-        };
-        if (!escrow.ok || !escrow.escrow_pda_hex || !escrow.tx_sig_hex) {
-            throw new ThreadError(`open-escrow failed: ${escrow.error ?? 'unknown'}`);
-        }
-
-        const signed = await this.buildAndSign('thread.accept_bid', {
-            offer_id_hex: args.offerIdHex,
+        // SDK visa-class self-custodial AcceptBid (mirrors postOffer/postBid).
+        // ADR-2026-0046 Path A: escrow opens on the native COSR chain as part
+        // of thread.accept_bid — no separate escrow-open call or envelope-only
+        // sign_acceptance step. The bridge build_doc canonicalises §16.4
+        // Acceptance; the SDK signs locally (cose_sign1_hex) and pre-signs the
+        // chain AcceptBid inner-tx (chain_inner_sig_hex); the bridge forwards
+        // both to chain ABCI as mailroom (ADR-2026-0224 D5+D6).
+        //
+        // Pre-flight: thread.build_doc returns the canonical Acceptance doc
+        // and the bridge's pre-computed acceptance_id_hex (which both the
+        // canonical doc and the chain escrow_id derivation depend on).
+        const buildParams: Record<string, unknown> = {
             bid_id_hex: args.bidIdHex,
             seller_id_hex: args.sellerIdHex,
             agreed_price_micro: args.agreedPriceMicro.toString(),
-            escrow_tx_sig_hex: escrow.tx_sig_hex,
-            escrow_pda_hex: escrow.escrow_pda_hex,
-            acceptance_id_hex: acceptanceIdHex,
+            offer_id_hex: args.offerIdHex,
+            // Path A: chain-native escrow opens via accept_bid AcceptBid TX;
+            // the Solana-era escrow_tx_sig + escrow_pda fields in §16.4
+            // Acceptance are zero-filled placeholders (build_doc CBOR still
+            // carries field-8/9 for back-compat; chain ABCI ignores them).
+            escrow_tx_sig_hex: '00'.repeat(64),
+            escrow_pda_hex: '00'.repeat(32),
+        };
+        const signed = await this.buildAndSign('thread.accept_bid', buildParams);
+        const acceptanceIdHex = (signed.extraIds['acceptance_id_hex'] as string)
+            ?? Buffer.from(rand(32)).toString('hex');
+
+        // Chain AcceptBid: encode + sign inner-tx locally.
+        // chain_escrow_id = sha256(bid_id) per ADR-2026-0046.
+        const nonce = await this.getNextChainNonce();
+        const buyerIdBytes = sha256(this.kp.publicKey);
+        const bidIdBytes = new Uint8Array(Buffer.from(args.bidIdHex, 'hex'));
+        const chainEscrowId = sha256(bidIdBytes);
+        const innerBytes = encodeAcceptBid(
+            buyerIdBytes,
+            bidIdBytes,
+            chainEscrowId,
+            args.agreedPriceMicro,
+            nonce,
+        );
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+
+        const submitParams = this.packPassthroughParams({
+            baseParams: { ...buildParams, acceptance_id_hex: acceptanceIdHex },
+            signed,
+            chainInnerSigHex,
+            nonce,
         });
-        await this.invoke('thread.sign_acceptance', {
-            cose_sign1_hex: signed.coseHex,
-            doc_id_hex: signed.docIdHex,
-            agent_pubkey_hex: signed.agentPubkeyHex,
-        });
-        return { acceptanceIdHex };
+        const { result } = await this.invoke('thread.accept_bid', submitParams);
+        const r = result as { acceptance_id_hex?: string };
+        return { acceptanceIdHex: r.acceptance_id_hex ?? acceptanceIdHex };
     }
 
     async queryEscrow(acceptanceIdHex: string): Promise<Record<string, unknown>> {
