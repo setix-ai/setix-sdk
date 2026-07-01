@@ -16,6 +16,10 @@
     "typecheck": "tsc --noEmit",
     "test": "echo 'No tests in this package yet' && exit 0"
   },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.5"
+  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
