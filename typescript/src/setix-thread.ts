@@ -55,16 +55,17 @@ import { dirname, join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+// SDK identity sent on every request. Cold-LLM Run 4 finding RUN4.S1: stock
+// stdlib HTTP clients (notably Python urllib) hit Cloudflare WAF rule 1010
+// without a UA. Set one explicitly for parity across SDKs.
+const SETIX_SDK_USER_AGENT = 'setix-thread-sdk/0.1 (typescript)';
 // @ts-ignore — cborg resolves at runtime from the monorepo's platform/node_modules
 import { encode as cborEncode, decode as cborDecode, Tagged, rfc8949EncodeOptions } from 'cborg';
 // @ts-ignore — @noble/curves resolves at runtime from the monorepo's platform/node_modules
 import { ed25519 } from '@noble/curves/ed25519';
-// B.1.b M2 — local chain-tx encoders (byte-equivalent to bridge's
-// native-chain-tools.ts) + signChainTxLocal helper. SDK self-custodial
-// chain-tx submission per ADR-2026-0228 Founder Decision 2 ("bridge-as-
-// mailroom") — the SDK encodes the chain inner + signs locally, the bridge
-// forwards the resulting `chain_inner_sig_hex` to chain ABCI without ever
-// touching the agent's private key.
+// Chain-tx encoders + signChainTxLocal helper. The SDK encodes the chain
+// transaction and signs it locally; the bridge relays the resulting
+// `chain_inner_sig_hex` to the chain and never holds your private key.
 import {
     encodePostOffer,
     encodePostBid,
@@ -83,6 +84,21 @@ const COSE_HEADER_KID = 4;
 const COSE_HEADER_VERSION = 16;
 const COSE_ALG_EDDSA = -8;
 const COSE_SIGN1_TAG = 18;
+
+// THREAD protocol version this SDK speaks — the COSE_Sign1 protected-header[16]
+// `[major, minor]` pair stamped on every signed document (pre-launch v0.x
+// documents carry [0, x]). This is the canonical-current ratified protocol:
+// THREAD v0.7, the frozen pre-launch spec (the last freeze before the v1.0.0
+// launch). The bridge gates only the MAJOR version (accepts 0 pre-prod / 1+
+// production); the minor is forward-compatible.
+//
+// INDEPENDENT VERSION STREAMS (the Stripe / Twilio / AWS pattern): the SDK
+// *package* version and the THREAD *protocol* version are decoupled. This package
+// ships at semver 0.0.x; THREAD_VERSION below DECLARES the protocol the SDK speaks.
+// The two move on their own cadences — a package release never implies a protocol
+// change, and a protocol bump (a founder-signed version-stamp at the v1.0.0 launch)
+// is reflected by updating THREAD_VERSION here, not by coupling it to the package
+// number.
 const THREAD_VERSION: [number, number] = [0, 7];
 
 // ---- errors ---------------------------------------------------------------
@@ -125,10 +141,10 @@ function signCose(
         [COSE_HEADER_VERSION, [...THREAD_VERSION]],
     ]);
     const protectedBytes = enc(protectedMap);
-    // SEC-EXT-C11 (v0.2.242): bind signature to audience region via
-    // external_aad per RFC 9052 §4.4. Undefined → empty bytes (back-compat
-    // with v0.2.241-and-earlier signers). New callers SHOULD pass the
-    // region identifier of the bridge they intend to submit to.
+    // Bind signature to audience region via the RFC 9052 external_aad
+    // parameter. Undefined → empty bytes (back-compat with earlier signers).
+    // New callers SHOULD pass the region identifier of the bridge they
+    // intend to submit to.
     const aad = regionId ? new TextEncoder().encode(regionId) : new Uint8Array(0);
     const sigStructure = ['Signature1', protectedBytes, aad, payload];
     const sigInput = enc(sigStructure);
@@ -195,6 +211,7 @@ function httpPost(target: string, path: string, body: unknown): Promise<HttpResu
                 headers: {
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(bodyStr),
+                    'User-Agent': SETIX_SDK_USER_AGENT,
                 },
             },
             (res) => {
@@ -219,39 +236,6 @@ function httpPost(target: string, path: string, body: unknown): Promise<HttpResu
     });
 }
 
-// ---- /.well-known/thread-protocol GET helper ------------------------------
-
-function httpGetJson(target: string, path: string): Promise<Record<string, unknown>> {
-    return new Promise((resolve, reject) => {
-        const url = new URL(path, target);
-        const isHttps = url.protocol === 'https:';
-        const reqFn = isHttps ? httpsRequest : httpRequest;
-        const buf: Buffer[] = [];
-        const req = reqFn(
-            {
-                hostname: url.hostname,
-                port: url.port || (isHttps ? 443 : 80),
-                path: url.pathname + url.search,
-                method: 'GET',
-                headers: { Accept: 'application/json' },
-            },
-            (res) => {
-                res.on('data', (c: Buffer) => buf.push(c));
-                res.on('end', () => {
-                    const raw = Buffer.concat(buf).toString('utf8');
-                    try {
-                        resolve(JSON.parse(raw) as Record<string, unknown>);
-                    } catch {
-                        resolve({});
-                    }
-                });
-            },
-        );
-        req.on('error', reject);
-        req.end();
-    });
-}
-
 // ---- main client ----------------------------------------------------------
 
 export interface ThreadClientOptions {
@@ -265,16 +249,6 @@ export class ThreadClient {
     readonly kp: Keypair;
     setixCode: number | null = null;
     agentIdHex: string | null = null;
-    /** Cached region→bridge-URL map pulled from /.well-known/thread-protocol.
-     * Populated lazily on the first origin_region_unavailable:<X> rejection
-     * (renamed from legacy wrong_region: at B.3 M1 / setix-v0.2.352, per
-     * ADR-2026-0222 D6+D7), or via a manual refresh hint. The bridge has 1h
-     * Cache-Control on /.well-known; in-process TTL of 60s — short enough to
-     * pick up topology changes within a swarm-test run, long enough to
-     * amortize the GET. */
-    private regionUrls: Map<string, string> = new Map();
-    private regionUrlsFetchedAt: number = 0;
-    private static readonly REGION_CACHE_TTL_MS = 60_000;
 
     constructor(opts: ThreadClientOptions | string) {
         const o = typeof opts === 'string' ? { bridgeUrl: opts } : opts;
@@ -282,37 +256,6 @@ export class ThreadClient {
         this.keyPath = o.keyPath ?? defaultKeyPath();
         this.kp = loadOrCreateKeypair(this.keyPath);
         this.loadMeta();
-    }
-
-    /** Refresh the cached region→bridge-URL map from
-     * /.well-known/thread-protocol. Best-effort; on failure the cache is
-     * left as-is (an empty map means single-region or the bridge hasn't
-     * advertised a regions field — both legitimate). */
-    private async refreshRegionUrls(): Promise<void> {
-        try {
-            const desc = await httpGetJson(this.bridgeUrl, '/.well-known/thread-protocol');
-            const regions = desc['regions'];
-            if (regions && typeof regions === 'object' && !Array.isArray(regions)) {
-                const next = new Map<string, string>();
-                for (const [k, v] of Object.entries(regions)) {
-                    if (typeof v === 'string') next.set(k, v);
-                }
-                this.regionUrls = next;
-                this.regionUrlsFetchedAt = Date.now();
-            }
-        } catch { /* leave cache as-is */ }
-    }
-
-    /** v0.2.63 — resolve a peer region's bridge URL. Returns null when the
-     * region is unknown after a fresh /.well-known fetch (signals a true
-     * gap, not a stale cache). */
-    private async lookupRegionUrl(region: string): Promise<string | null> {
-        const cached = this.regionUrls.get(region);
-        if (cached && (Date.now() - this.regionUrlsFetchedAt) < ThreadClient.REGION_CACHE_TTL_MS) {
-            return cached;
-        }
-        await this.refreshRegionUrls();
-        return this.regionUrls.get(region) ?? null;
     }
 
     private metaPath(): string {
@@ -339,63 +282,17 @@ export class ThreadClient {
     private async invoke(tool: string, params: Record<string, unknown>): Promise<{ result: unknown; servedSlot: bigint }> {
         const { body, servedSlot } = await httpPost(this.bridgeUrl, '/mcp/invoke', { tool, params });
         if (body['error']) {
-            const err = body['error'] as {
-                code?: number;
-                message?: string;
-                data?: {
-                    retry_url?: string;
-                    // B.3 M1 (setix-v0.2.352) §19.6.5 contract per ADR-2026-0222 D7.
-                    protocol_error_code?: string;
-                    origin_region?: string;
-                    retry_after_slots?: number | null;
-                    healthy_regions?: string[];
-                };
-            };
+            const err = body['error'] as { code?: number; message?: string };
             const message = err.message ?? JSON.stringify(err);
-
-            // Region redirect helper.
-            // On `origin_region_unavailable:<X>` rejections (renamed from legacy
-            // `wrong_region:` at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7),
-            // the bridge hints `origin_region` + `retry_url` in error.data; we
-            // also fall back to the cached well-known regions map. One-hop max —
-            // if the retried bridge also rejects, surface that error directly
-            // (no chained redirect).
-            const targetRegion = err.data?.origin_region
-                ?? message.match(/origin_region_unavailable:([a-z0-9][a-z0-9\-]{0,31})/)?.[1];
-            if (targetRegion) {
-                let retryUrl = err.data?.retry_url;
-                if (!retryUrl) {
-                    const looked = await this.lookupRegionUrl(targetRegion);
-                    if (looked) retryUrl = looked;
-                }
-                if (retryUrl) {
-                    const peerBase = retryUrl.replace(/\/$/, '');
-                    if (this.regionUrls.get(targetRegion) !== peerBase) {
-                        this.regionUrls.set(targetRegion, peerBase);
-                        if (this.regionUrlsFetchedAt === 0) {
-                            this.regionUrlsFetchedAt = Date.now();
-                        }
-                    }
-                    const retried = await httpPost(peerBase, '/mcp/invoke', { tool, params });
-                    if (retried.body['error']) {
-                        const e2 = retried.body['error'] as { code?: number; message?: string };
-                        throw new BridgeError(e2.code ?? '?', e2.message ?? JSON.stringify(e2));
-                    }
-                    return { result: retried.body['result'], servedSlot: retried.servedSlot };
-                }
-            }
-
             throw new BridgeError(err.code ?? '?', message);
         }
         return { result: body['result'], servedSlot };
     }
 
     /**
-     * B.1.b M3 — SDK self-custodial doc-signing primitive
-     * (ADR-2026-0224 D5+D6 + ADR-2026-0228 Founder Decision 2,
-     * "bridge-as-mailroom").
+     * Build and sign a THREAD document.
      *
-     * Calls `thread.build_doc` with the requested HL tool + raw params,
+     * Calls `thread.build_doc` with the requested tool + raw params,
      * receives the bridge-issued canonical CBOR bytes + replay-protection
      * `doc_id_hex`, ed25519-signs locally via `signCose`, and returns the
      * pre-built submission bag for the caller to merge into the HL tool's
@@ -449,10 +346,9 @@ export class ThreadClient {
     }
 
     /**
-     * B.1.b M3 — fetch the agent's next chain nonce via the public
-     * `thread.get_next_nonce` surface. Used by SDK self-custodial chain-TX
-     * callers to compute identical inner-bytes to what the bridge will
-     * re-encode after passthrough (chain ABCI rejects sig/payload mismatch).
+     * Fetch this agent's next chain nonce via the public
+     * `thread.get_next_nonce` tool, so locally-encoded chain transactions
+     * carry the nonce the chain expects.
      */
     private async getNextChainNonce(): Promise<bigint> {
         if (!this.agentIdHex) {
@@ -467,9 +363,9 @@ export class ThreadClient {
     }
 
     /**
-     * B.1.b M3 — common pack helper for SDK calls that submit both a
-     * pre-signed COSE envelope AND a pre-signed chain inner-tx sig. Returns
-     * the params bag with `cose_sign1_hex`, `doc_id_hex`, `agent_pubkey_hex`,
+     * Common pack helper for calls that submit both a signed COSE envelope
+     * AND a signed chain transaction. Returns the params bag with
+     * `cose_sign1_hex`, `doc_id_hex`, `agent_pubkey_hex`,
      * `chain_inner_sig_hex`, and `nonce` merged in.
      */
     private packPassthroughParams(args: {
@@ -496,50 +392,66 @@ export class ThreadClient {
         return { ...(result as object), served_slot: servedSlot.toString(), your_pubkey_hex: this.kp.pubkeyHex };
     }
 
+    /** The chain's id (cached), used for chain-id-domain-separated signing.
+     *  A signature is bound to one network, so a signature made for a test
+     *  network is invalid on another. Read once from
+     *  `platform_health.native_chain_id`. */
+    private _nativeChainId: string | null = null;
+    private async getNativeChainId(): Promise<string> {
+        if (this._nativeChainId !== null) return this._nativeChainId;
+        const health = await this.platformHealth();
+        const id = (health as Record<string, unknown>)['native_chain_id'];
+        if (typeof id !== 'string' || id.length === 0) {
+            throw new Error('SDK: bridge platform_health did not return native_chain_id (chain unreachable, or an older bridge)');
+        }
+        this._nativeChainId = id;
+        return id;
+    }
+
     async register(description: string): Promise<{ agentIdHex: string; setixCode: number; pubkeyHex: string }> {
-        // B.1.b M3 — SDK self-custodial register. Bypasses `thread.register`
-        // (which historically required `secret_key_hex` so the bridge could
-        // sign the challenge + chain register TX in-process) and composes
-        // the three public sub-tools directly:
-        //   1. thread.scout                   — derive setix_code + profile_id
-        //   2. thread.quick_register_challenge — fetch challenge bytes + chain
-        //                                        register-tx bytes (no key
-        //                                        material in flight)
-        //   3. SDK ed25519-signs both locally
-        //   4. thread.quick_register          — submit signatures + idempotency
-        // Bridge-as-mailroom invariant intact: the agent's private key never
-        // crosses the SDK process boundary.
+        // Register this agent. Your key never leaves this process: the SDK
+        // fetches a challenge, signs the challenge and the chain registration
+        // transaction locally, and submits only the signatures.
+        //
+        // Flow: scout (classify the description) -> request a challenge ->
+        // sign the challenge and the chain registration transaction locally
+        // -> submit the signatures.
         let setixCode = 0;
         let capabilityProfileId = 'general';
         try {
             const { result: scoutRes } = await this.invoke('thread.scout', {
                 nl_self_description: description,
             });
-            const sr = scoutRes as { setix_code?: number; capability_profile_id?: string };
-            setixCode = sr.setix_code ?? 0;
-            capabilityProfileId = sr.capability_profile_id ?? 'general';
-        } catch { /* scout is best-effort */ }
+            const scout = scoutRes as { setix_code?: number | string; capability_profile_id?: string };
+            setixCode = Number(scout.setix_code ?? 0);
+            if (typeof scout.capability_profile_id === 'string' && scout.capability_profile_id.length > 0) {
+                capabilityProfileId = scout.capability_profile_id;
+            }
+        } catch (e) {
+            if (!(e instanceof ThreadError)) throw e;
+            // scout is best-effort; fall through with defaults
+        }
 
-        const { result: challengeRes } = await this.invoke('thread.quick_register_challenge', {
+        const { result: challRes } = await this.invoke('thread.quick_register_challenge', {
             caller_pubkey_hex: this.kp.pubkeyHex,
         });
-        const cr = challengeRes as {
-            challenge_hex: string;
-            chain_register_tx_bytes_hex: string;
-        };
-        const challengeBytes = new Uint8Array(Buffer.from(cr.challenge_hex, 'hex'));
-        const chainTxBytes = new Uint8Array(Buffer.from(cr.chain_register_tx_bytes_hex, 'hex'));
+        const chall = challRes as { challenge_hex: string; chain_register_tx_bytes_hex: string };
+        const challengeBytes = new Uint8Array(Buffer.from(chall.challenge_hex, 'hex'));
+        const chainTxBytes = new Uint8Array(Buffer.from(chall.chain_register_tx_bytes_hex, 'hex'));
+        // The challenge is a bridge-issued nonce — sign it directly. The chain
+        // registration transaction is signed with chain-id domain separation,
+        // the same scheme as every other chain transaction.
         const challengeSig = ed25519.sign(challengeBytes, this.kp.privateKey);
-        const chainRegisterSig = ed25519.sign(chainTxBytes, this.kp.privateKey);
-        const idempotencyKey = rand(32);
+        const chainRegisterSig = signChainTxLocal(chainTxBytes, this.kp.privateKey, await this.getNativeChainId());
 
         const { result: regRes } = await this.invoke('thread.quick_register', {
             capability_profile_id: capabilityProfileId,
             tier: 0,
             caller_pubkey_hex: this.kp.pubkeyHex,
-            idempotency_key_hex: Buffer.from(idempotencyKey).toString('hex'),
-            challenge_hex: cr.challenge_hex,
+            idempotency_key_hex: randomBytes(32).toString('hex'),
+            challenge_hex: chall.challenge_hex,
             challenge_sig_hex: Buffer.from(challengeSig).toString('hex'),
+            chain_register_tx_bytes_hex: chall.chain_register_tx_bytes_hex,
             chain_register_sig_hex: Buffer.from(chainRegisterSig).toString('hex'),
         });
         const reg = regRes as {
@@ -584,8 +496,6 @@ export class ThreadClient {
     async postOffer(args: {
         maxPriceMicro: bigint;
         setixCode?: number;
-        /** Bridge region where this offer is being submitted (e.g., 'region-a'). MANDATORY per SEC-004. */
-        originRegion?: string;
     }): Promise<{ offerIdHex: string }> {
         const sc = args.setixCode ?? this.setixCode;
         if (sc === null) throw new ThreadError('Call register() first or pass setixCode');
@@ -593,11 +503,10 @@ export class ThreadClient {
             max_price_micro: args.maxPriceMicro.toString(),
             setix_code: sc,
         };
-        if (args.originRegion !== undefined) buildParams['origin_region'] = args.originRegion;
         const signed = await this.buildAndSign('thread.post_offer', buildParams);
         const offerIdHex = signed.extraIds['offer_id_hex'] as string;
         if (!offerIdHex) throw new ThreadError('build_doc did not return offer_id_hex');
-        // Chain PostOffer: encode + sign inner-tx locally (bridge-as-mailroom).
+        // Chain PostOffer: encode + sign the inner transaction locally.
         const nonce = await this.getNextChainNonce();
         const agentIdBytes = sha256(this.kp.publicKey);
         const offerIdBytes = new Uint8Array(Buffer.from(offerIdHex, 'hex'));
@@ -609,7 +518,7 @@ export class ThreadClient {
             args.maxPriceMicro,
             nonce,
         );
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
         const submitParams = this.packPassthroughParams({
             baseParams: { ...buildParams, offer_id_hex: offerIdHex },
             signed,
@@ -665,9 +574,10 @@ export class ThreadClient {
             new Uint8Array(Buffer.from(bidIdHex, 'hex')),
             new Uint8Array(Buffer.from(args.offerIdHex, 'hex')),
             price,
+            BigInt(args.quotedLatencyMs ?? 5000),
             nonce,
         );
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
         const submitParams = this.packPassthroughParams({
             baseParams: { ...buildParams, bid_id_hex: bidIdHex },
             signed,
@@ -697,26 +607,22 @@ export class ThreadClient {
     async acceptBid(args: {
         offerIdHex: string; bidIdHex: string; sellerIdHex: string; agreedPriceMicro: bigint;
     }): Promise<{ acceptanceIdHex: string }> {
-        // SDK visa-class self-custodial AcceptBid (mirrors postOffer/postBid).
-        // ADR-2026-0046 Path A: escrow opens on the native COSR chain as part
-        // of thread.accept_bid — no separate escrow-open call or envelope-only
-        // sign_acceptance step. The bridge build_doc canonicalises §16.4
-        // Acceptance; the SDK signs locally (cose_sign1_hex) and pre-signs the
-        // chain AcceptBid inner-tx (chain_inner_sig_hex); the bridge forwards
-        // both to chain ABCI as mailroom (ADR-2026-0224 D5+D6).
+        // Accept a bid (mirrors postOffer/postBid). Escrow opens on the chain
+        // as part of accept_bid — there is no separate escrow-open call. The
+        // bridge canonicalises the Acceptance document; the SDK signs it
+        // locally (cose_sign1_hex) and also signs the chain AcceptBid
+        // transaction locally (chain_inner_sig_hex); the bridge relays both.
         //
-        // Pre-flight: thread.build_doc returns the canonical Acceptance doc
-        // and the bridge's pre-computed acceptance_id_hex (which both the
-        // canonical doc and the chain escrow_id derivation depend on).
+        // Pre-flight: thread.build_doc returns the canonical Acceptance
+        // document and the acceptance_id_hex (which both the canonical
+        // document and the chain escrow_id derivation depend on).
         const buildParams: Record<string, unknown> = {
             bid_id_hex: args.bidIdHex,
             seller_id_hex: args.sellerIdHex,
             agreed_price_micro: args.agreedPriceMicro.toString(),
             offer_id_hex: args.offerIdHex,
-            // Path A: chain-native escrow opens via accept_bid AcceptBid TX;
-            // the Solana-era escrow_tx_sig + escrow_pda fields in §16.4
-            // Acceptance are zero-filled placeholders (build_doc CBOR still
-            // carries field-8/9 for back-compat; chain ABCI ignores them).
+            // Escrow opens via the chain AcceptBid transaction; these two
+            // fields are unused placeholders kept for wire back-compat.
             escrow_tx_sig_hex: '00'.repeat(64),
             escrow_pda_hex: '00'.repeat(32),
         };
@@ -725,7 +631,7 @@ export class ThreadClient {
             ?? Buffer.from(rand(32)).toString('hex');
 
         // Chain AcceptBid: encode + sign inner-tx locally.
-        // chain_escrow_id = sha256(bid_id) per ADR-2026-0046.
+        // chain_escrow_id = sha256(bid_id).
         const nonce = await this.getNextChainNonce();
         const buyerIdBytes = sha256(this.kp.publicKey);
         const bidIdBytes = new Uint8Array(Buffer.from(args.bidIdHex, 'hex'));
@@ -737,7 +643,7 @@ export class ThreadClient {
             args.agreedPriceMicro,
             nonce,
         );
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
 
         const submitParams = this.packPassthroughParams({
             baseParams: { ...buildParams, acceptance_id_hex: acceptanceIdHex },
@@ -775,12 +681,20 @@ export class ThreadClient {
 
     async submitDelivery(args: {
         acceptanceIdHex: string; buyerIdHex: string; output: string;
+        // encrypted delivery store: for a setix-store:// delivery,
+        // pass output:"" + outputUri=setix-store://<hash> + the SELLER-ASSERTED
+        // outputHashHex (sha256 of the PLAINTEXT) + outputKeyWrapHex (the sealed key
+        // from encryptDeliveryArtifact in ./delivery-crypto). The bridge stores them
+        // opaquely; it never sees plaintext. Omit all three for a normal delivery.
+        outputUri?: string; outputHashHex?: string; outputKeyWrapHex?: string;
     }): Promise<{ deliveryIdHex: string; outputHashHex: string }> {
-        // B.1.b M3 — SDK self-custodial: bridge `thread.build_doc`
-        // canonicalises the §16.5 Delivery (ADR-2026-0224 D6). The SDK
-        // signs the canonical bytes locally + encodes the chain
-        // SubmitDelivery inner-tx locally + ed25519-signs that locally too.
-        const outputHash = sha256(new TextEncoder().encode(args.output));
+        // The bridge `thread.build_doc` canonicalises the Delivery document;
+        // the SDK signs the canonical bytes locally and also encodes + signs
+        // the chain SubmitDelivery transaction locally.
+        const isStore = typeof args.outputUri === 'string' && args.outputUri.startsWith('setix-store://');
+        const outputHash = args.outputHashHex
+            ? new Uint8Array(Buffer.from(args.outputHashHex, 'hex'))
+            : sha256(new TextEncoder().encode(args.output));
         const outputHashHex = Buffer.from(outputHash).toString('hex');
 
         // Pre-flight: resolve bid_id (needed for chain_escrow_id = sha256(bid_id)).
@@ -795,8 +709,9 @@ export class ThreadClient {
         const signed = await this.buildAndSign('thread.submit_delivery', {
             acceptance_id_hex: args.acceptanceIdHex,
             buyer_id_hex: args.buyerIdHex,
-            output: args.output,
+            output: isStore ? '' : args.output,
             output_hash_hex: outputHashHex,
+            ...(isStore ? { output_uri: args.outputUri, output_key_wrap_hex: args.outputKeyWrapHex } : {}),
         });
         const deliveryIdHex = signed.extraIds['delivery_id_hex'] as string;
         if (!deliveryIdHex) throw new ThreadError('build_doc did not return delivery_id_hex');
@@ -805,15 +720,16 @@ export class ThreadClient {
         const nonce = await this.getNextChainNonce();
         const agentIdBytes = sha256(this.kp.publicKey);
         const innerBytes = encodeSubmitDelivery(agentIdBytes, chainEscrowId, outputHash, nonce);
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
 
         const submitParams = this.packPassthroughParams({
             baseParams: {
                 acceptance_id_hex: args.acceptanceIdHex,
                 buyer_id_hex: args.buyerIdHex,
-                output: args.output,
+                output: isStore ? '' : args.output,
                 output_hash_hex: outputHashHex,
                 delivery_id_hex: deliveryIdHex,
+                ...(isStore ? { output_uri: args.outputUri, output_key_wrap_hex: args.outputKeyWrapHex } : {}),
             },
             signed,
             chainInnerSigHex,
@@ -921,11 +837,10 @@ export class ThreadClient {
         evidenceHashHex?: string;
         evidenceBondMicro?: bigint;
     }): Promise<{ disputeIdHex: string; status: string; assignedOracleHex: string | null }> {
-        // B.1.b M3 — SDK self-custodial Dispute. Bridge `thread.build_doc`
-        // canonicalises §16.7 Dispute; SDK signs locally; SDK encodes + signs
-        // chain MarkDisputed inner-tx locally. Pre-flight resolves the bid_id
-        // (the chain_escrow_id = sha256(bid_id) — the same derivation the
-        // bridge handler uses internally before chain submission).
+        // The bridge `thread.build_doc` canonicalises the Dispute document;
+        // the SDK signs it locally and also encodes + signs the chain
+        // MarkDisputed transaction locally. Pre-flight resolves the bid_id
+        // (chain_escrow_id = sha256(bid_id)).
         const buildParams: Record<string, unknown> = {
             delivery_id_hex: args.deliveryIdHex,
             reason: args.reason ?? 0,
@@ -970,7 +885,7 @@ export class ThreadClient {
         const filerIdBytes = sha256(this.kp.publicKey);
         const disputeIdBytes = new Uint8Array(Buffer.from(disputeIdHex, 'hex'));
         const innerBytes = encodeMarkDisputed(chainEscrowId, disputeIdBytes, filerIdBytes, nonce);
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
 
         const submitParams = this.packPassthroughParams({
             baseParams: { ...buildParams, dispute_id_hex: disputeIdHex },
@@ -995,28 +910,25 @@ export class ThreadClient {
     }
 
     /**
-     * B.1.b M3 (deprecation) — `acceptBidHl(bid_id_hex)` historically relied
-     * on the bridge holding the agent's seed and looking up the bid row
-     * internally. That path required `secret_key_hex` transmission and is
-     * incompatible with the visa-class non-custodial invariant
-     * (ADR-2026-0224 D5). Callers MUST migrate to the full `acceptBid`
-     * which accepts the offer / seller / price explicitly — those fields
-     * are visible to buyers via `queryBids(offerIdHex)`.
+     * Deprecated. `acceptBidHl(bid_id_hex)` required transmitting your secret
+     * key to the bridge, which is incompatible with the non-custodial design.
+     * Use the full `acceptBid`, which accepts the offer / seller / price
+     * explicitly — those fields are visible to buyers via `queryBids(offerIdHex)`.
      *
-     * Retained as a throwing stub so legacy code surfaces the migration
-     * clearly rather than silently breaking.
+     * Retained as a throwing stub so older code surfaces the migration clearly
+     * rather than silently breaking.
      */
     async acceptBidHl(bidIdHex: string): Promise<Record<string, unknown>> {
         void bidIdHex;
         throw new ThreadError(
-            'acceptBidHl is deprecated in B.1.b — use acceptBid({ offerIdHex, bidIdHex, sellerIdHex, agreedPriceMicro }). ' +
-            'Fields come from queryBids(offerIdHex). See ADR-2026-0224 D5.',
+            'acceptBidHl is deprecated — use acceptBid({ offerIdHex, bidIdHex, sellerIdHex, agreedPriceMicro }). ' +
+            'Fields come from queryBids(offerIdHex).',
         );
     }
 
     /**
-     * B.1.b M3 — submitDeliveryHl now self-custodial. Resolves buyer_id
-     * from the escrow row + delegates to the non-Hl `submitDelivery` flow.
+     * Resolves buyer_id from the escrow row, then delegates to the
+     * `submitDelivery` flow.
      */
     async submitDeliveryHl(opts: {
         acceptanceIdHex: string;
@@ -1069,12 +981,11 @@ export class ThreadClient {
     }
 
     /**
-     * B.1.b M3 — self-custodial settle. Resolves seller / agreed_price /
-     * output_hash via `thread.query_escrow_by_bid` (or query_escrow when
-     * acceptance_id_hex is supplied), `thread.build_doc`-canonicalises the
-     * §16.6 Settlement doc, ed25519-signs the canonical bytes locally, and
-     * encodes + signs the chain Settle inner-tx locally. Bridge-as-mailroom
-     * invariant: zero key material in flight.
+     * Settle a completed trade. Resolves seller / agreed_price / output_hash
+     * via `thread.query_escrow_by_bid` (or `thread.query_escrow` when
+     * acceptance_id_hex is supplied); the bridge canonicalises the Settlement
+     * document; the SDK signs the canonical bytes locally and also encodes +
+     * signs the chain Settle transaction locally.
      */
     async settleHl(opts: {
         deliveryIdHex?: string;
@@ -1125,7 +1036,7 @@ export class ThreadClient {
         const agentIdBytes = sha256(this.kp.publicKey);
         const chainEscrowId = sha256(new Uint8Array(Buffer.from(bidIdHex, 'hex')));
         const innerBytes = encodeSettle(agentIdBytes, chainEscrowId, nonce);
-        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey)).toString('hex');
+        const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
 
         const submitParams = this.packPassthroughParams({
             baseParams: {
@@ -1231,9 +1142,8 @@ export class ThreadClient {
         intentIdHex: string;
         claimIdHex: string;
     }): Promise<{ accepted: boolean; intentIdHex: string; workflowIdHex: string; status: string }> {
-        // B.1.b M3 — handler authorises via agent_id derived from pubkey;
-        // no canonical doc to sign, so passing `agent_pubkey_hex` instead of
-        // `secret_key_hex` suffices for the visa-class invariant.
+        // No document to sign here; the handler authorises via your public
+        // key (agent_pubkey_hex).
         const { result } = await this.invoke('thread.accept_workflow_manifest', {
             agent_pubkey_hex: this.kp.pubkeyHex,
             intent_id_hex: args.intentIdHex,
@@ -1282,12 +1192,10 @@ export class ThreadClient {
         if (args.intentIdHex !== undefined) buildParams['intent_id_hex'] = args.intentIdHex;
         if (args.workflowIdHex !== undefined) buildParams['workflow_id_hex'] = args.workflowIdHex;
         if (args.predicateResultHex !== undefined) buildParams['predicate_result_hex'] = args.predicateResultHex;
-        // Bridge's intent-workflow.ts settle_workflow_manifest handler does
-        // build the Nested Settlement doc internally; route through
-        // build_doc passthrough. Note: as of B.1.b, build_doc dispatcher
-        // does not yet cover thread.settle_workflow_manifest — fall back to
-        // submitting agent_pubkey_hex only when build_doc rejects with
-        // not-dispatchable. The supervisor extends dispatch in B.1.c.
+        // The bridge builds the Nested Settlement document internally; route
+        // through the build_doc path. build_doc does not cover
+        // thread.settle_workflow_manifest yet — fall back to submitting the
+        // public key only when build_doc reports the tool is not dispatchable.
         let submitParams: Record<string, unknown>;
         try {
             const signed = await this.buildAndSign('thread.settle_workflow_manifest', buildParams);
@@ -1295,8 +1203,7 @@ export class ThreadClient {
         } catch (e) {
             const msg = (e as Error).message ?? '';
             if (!/not dispatchable/.test(msg)) throw e;
-            // Fallback: pass identity only. The bridge handler's resolveAgentPubkey
-            // accepts agent_pubkey_hex without secret_key_hex.
+            // Fallback: pass identity only (public key, no secret key).
             submitParams = { ...buildParams, agent_pubkey_hex: this.kp.pubkeyHex };
         }
         const { result } = await this.invoke('thread.settle_workflow_manifest', submitParams);
@@ -1323,9 +1230,8 @@ export class ThreadClient {
         evidenceUri: string;
         evidenceBondMicro?: bigint;
     }): Promise<{ disputeIdHex: string; status: string; assignedOracleHex: string | null }> {
-        // B.1.b M3 — workflow-step dispute is bridge-orchestrated (no SDK-built
-        // doc); the handler authorises via pubkey-derived agent_id. Replace
-        // `secret_key_hex` with `agent_pubkey_hex` for the visa-class invariant.
+        // No document to sign here; the handler authorises via your public
+        // key (agent_pubkey_hex).
         const params: Record<string, unknown> = {
             agent_pubkey_hex: this.kp.pubkeyHex,
             workflow_id_hex: args.workflowIdHex,
@@ -1420,8 +1326,7 @@ export async function buyerLoop(opts: {
     const chosen = bids.reduce((a, b) =>
         BigInt(a['quoted_price_micro'] as string) < BigInt(b['quoted_price_micro'] as string) ? a : b
     );
-    // B.1.b M3 — acceptBidHl was deprecated; route through the full
-    // self-custodial acceptBid flow using the bid row's published fields.
+    // Use the full acceptBid flow with the bid row's published fields.
     const acc = await client.acceptBid({
         offerIdHex: chosen['offer_id_hex'] as string,
         bidIdHex: chosen['bid_id_hex'] as string,
@@ -1613,11 +1518,8 @@ export async function autoTrade(opts: {
     return { role: 'seller', ...delivery };
 }
 
-// SEC-EXT-H04 (v0.2.250, CHUNK-EXT-15) — chain-tx builders for the gated
-// `chain.*` / `market.*` MCP surface moved out of the bridge-served public
-// SDK into `platform/scripts/operator-sdk/setix-chain-builders.ts`. Public
-// THREAD agents talk to `thread.*` HL tools only; raw chain access remains
-// available to operators via direct filesystem import.
+// This client speaks the public `thread.*` tools only. Privileged chain and
+// market operations are not part of the public surface.
 
 // Silence unused-import warnings on cborDecode if downstream tools strip it.
 void cborDecode;

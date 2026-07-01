@@ -1,6 +1,6 @@
 [project]
 name = "setix-thread"
-version = "0.0.4"
+version = "0.0.5"
 description = "Setix THREAD SDK — Python client library"
 license = { text = "Apache-2.0" }
 readme = "../README.md"

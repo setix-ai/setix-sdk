@@ -66,10 +66,9 @@ except ImportError as e:
         "setix_thread requires cryptography: pip install cryptography"
     ) from e
 
-# B.1.b M4 — chain-tx encoders for SDK self-custodial chain TX submission
-# (ADR-2026-0228 Founder Decision 2 "bridge-as-mailroom"). Encoders are
-# byte-identical to the bridge-side and TS-side implementations; the
-# cross-language test fixture asserts the invariant.
+# Chain-tx encoders + local signing. The encoders build the exact chain
+# transaction bytes; the SDK signs them locally and submits only the
+# signature, so your private key never leaves this process.
 from .chain_tx_encoders import (
     encode_post_offer,
     encode_post_bid,
@@ -83,12 +82,30 @@ from .chain_tx_encoders import (
 
 _SETTLEMENT_FEE_BPS = 100
 
+# Cold-LLM Run 4 finding RUN4.S1: stock urllib's default UA ("Python-urllib/X.Y")
+# is blocked by Cloudflare WAF rule 1010. Send a real UA on every request.
+_SETIX_SDK_USER_AGENT = "setix-thread-sdk/0.1 (python)"
+
 # COSE protected-header keys
 COSE_HEADER_ALG = 1
 COSE_HEADER_KID = 4
 COSE_HEADER_VERSION = 16
 COSE_ALG_EDDSA = -8
 COSE_SIGN1_TAG = 18
+
+# THREAD protocol version this SDK speaks — the COSE_Sign1 protected-header[16]
+# [major, minor] pair stamped on every signed document (pre-launch v0.x documents
+# carry [0, x]). This is the canonical-current ratified protocol: THREAD v0.7, the
+# frozen pre-launch spec (the last freeze before the v1.0.0 launch). The bridge
+# gates only the MAJOR version (accepts 0 pre-prod / 1+ production); the minor is
+# forward-compatible.
+#
+# INDEPENDENT VERSION STREAMS (the Stripe / Twilio / AWS pattern): the SDK *package*
+# version and the THREAD *protocol* version are decoupled. This package ships at
+# semver 0.0.x; THREAD_VERSION below DECLARES the protocol the SDK speaks. The two
+# move on their own cadences — a package release never implies a protocol change,
+# and a protocol bump (a founder-signed version-stamp at the v1.0.0 launch) is
+# reflected by updating THREAD_VERSION here, not by coupling it to the package number.
 THREAD_VERSION = [0, 7]
 
 
@@ -131,11 +148,10 @@ def _sign_cose(
 ) -> bytes:
     """Wrap payload in a COSE_Sign1 envelope, signed with Ed25519.
 
-    SEC-EXT-C11 (setix-v0.2.242): when ``region_id`` is provided, the
-    signature is bound to that audience region via RFC 9052 §4.4
-    ``external_aad`` so it cannot be replayed against a bridge in a
-    different region. ``region_id=None`` preserves the v0.2.241-and-earlier
-    empty-AAD wire format (back-compat).
+    When ``region_id`` is provided, the signature is bound to that
+    audience region via the RFC 9052 ``external_aad`` parameter so it
+    cannot be replayed against a bridge in a different region.
+    ``region_id=None`` preserves the empty-AAD wire format (back-compat).
     """
     protected_map = {
         COSE_HEADER_ALG: COSE_ALG_EDDSA,
@@ -222,7 +238,13 @@ def _http_post(url: str, body_obj: Any) -> tuple[dict[str, Any], int]:
     """POST JSON to url. Returns (parsed_body, served_slot)."""
     body = json.dumps(body_obj).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": _SETIX_SDK_USER_AGENT,
+        },
+        method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -242,32 +264,11 @@ def _http_post(url: str, body_obj: Any) -> tuple[dict[str, Any], int]:
         return parsed, 0
 
 
-def _http_get_json(url: str) -> dict[str, Any]:
-    """GET JSON from url. Returns parsed body or {} on error."""
-    req = urllib.request.Request(
-        url, headers={"Accept": "application/json"}, method="GET"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8")
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return {}
-    except (urllib.error.URLError, urllib.error.HTTPError):
-        return {}
-
-
 # ---- main client ----------------------------------------------------------
 
 
 class ThreadClient:
     """High-level THREAD client. Methods mirror the MCP server's 10 tools."""
-
-    # Region cache TTL. Bridge response carries Cache-Control: max-age=3600 on the
-    # well-known endpoint; in-process 60s TTL so swarm-test runs pick up topology
-    # changes promptly while still amortizing the GET.
-    _REGION_CACHE_TTL_SEC: float = 60.0
 
     def __init__(
         self,
@@ -279,37 +280,8 @@ class ThreadClient:
         self.kp = _load_or_create_keypair(self.key_path)
         self.setix_code: int | None = None
         self.agent_id_hex: str | None = None
-        # v0.2.63 — region→bridge-URL map populated lazily from the
-        # bridge's /.well-known/thread-protocol on the first
-        # origin_region_unavailable:<X> rejection (renamed from legacy
-        # wrong_region: at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7).
-        # Empty when single-region or when the bridge does not advertise
-        # a regions field.
-        self._region_urls: dict[str, str] = {}
-        self._region_urls_fetched_at: float = 0.0
+        self._native_chain_id: str | None = None
         self._load_meta()
-
-    def _refresh_region_urls(self) -> None:
-        """Re-pull regions map from /.well-known/thread-protocol. Best-effort."""
-        desc = _http_get_json(f"{self.bridge_url}/.well-known/thread-protocol")
-        regions = desc.get("regions") if isinstance(desc, dict) else None
-        if isinstance(regions, dict):
-            self._region_urls = {
-                str(k): str(v) for k, v in regions.items() if isinstance(v, str)
-            }
-            self._region_urls_fetched_at = time.monotonic()
-
-    def _lookup_region_url(self, region: str) -> str | None:
-        """Resolve region → bridge URL, refreshing the cache if stale."""
-        cached = self._region_urls.get(region)
-        if (
-            cached
-            and (time.monotonic() - self._region_urls_fetched_at)
-            < self._REGION_CACHE_TTL_SEC
-        ):
-            return cached
-        self._refresh_region_urls()
-        return self._region_urls.get(region)
 
     # -- meta cache ---------------------------------------------------------
 
@@ -341,61 +313,44 @@ class ThreadClient:
         )
         if "error" in body:
             err = body["error"]
-            message = err.get("message", str(err))
-
-            # Region redirect helper.
-            # On `origin_region_unavailable:<X>` rejections (renamed from legacy
-            # `wrong_region:` at B.3 M1 / setix-v0.2.352 per ADR-2026-0222 D6+D7),
-            # the bridge hints `origin_region` + `retry_url` in error.data;
-            # fall back to the cached well-known regions map. One-hop max —
-            # chained redirects are not supported.
-            import re as _re
-
-            data = err.get("data") if isinstance(err, dict) else None
-            target_region: str | None = None
-            if isinstance(data, dict) and isinstance(data.get("origin_region"), str):
-                target_region = data["origin_region"]
-            else:
-                m = _re.search(r"origin_region_unavailable:([a-z0-9][a-z0-9\-]{0,31})", message)
-                if m:
-                    target_region = m.group(1)
-            if target_region is not None:
-                retry_url = (
-                    data.get("retry_url") if isinstance(data, dict) else None
-                )
-                if not retry_url:
-                    retry_url = self._lookup_region_url(target_region)
-                if retry_url:
-                    peer_base = retry_url.rstrip("/")
-                    if self._region_urls.get(target_region) != peer_base:
-                        self._region_urls[target_region] = peer_base
-                        if self._region_urls_fetched_at == 0.0:
-                            self._region_urls_fetched_at = time.monotonic()
-                    retried_body, retried_slot = _http_post(
-                        f"{peer_base}/mcp/invoke", {"tool": tool, "params": params}
-                    )
-                    if "error" in retried_body:
-                        e2 = retried_body["error"]
-                        raise BridgeError(
-                            e2.get("code", "?"), e2.get("message", str(e2))
-                        )
-                    return retried_body.get("result"), retried_slot
-
-            raise BridgeError(err.get("code", "?"), message)
+            message = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            code = err.get("code", "?") if isinstance(err, dict) else "?"
+            raise BridgeError(code, message)
         return body.get("result"), served_slot
 
     def _fresh_slot(self) -> int:
         _, slot = self._invoke("thread.platform_health", {})
         return slot
 
-    # -- B.1.b M4 helpers: SDK self-custodial doc + chain-tx signing -------
+    def _get_native_chain_id(self) -> str:
+        """Return the chain's id (used for chain-id-domain-separated signing).
+        Read once from `platform_health.native_chain_id` and cached."""
+        if self._native_chain_id is None:
+            result, _ = self._invoke("thread.platform_health", {})
+            cid = result.get("native_chain_id")
+            if not cid:
+                raise ThreadError(
+                    "bridge platform_health did not return native_chain_id "
+                    "(chain unreachable, or an older bridge)"
+                )
+            self._native_chain_id = cid
+        return self._native_chain_id
+
+    def _sign_chain(self, inner_bytes: bytes) -> str:
+        """Sign chain inner bytes locally with chain-id domain separation and
+        return the hex signature for `chain_inner_sig_hex`."""
+        return sign_chain_tx_local(
+            inner_bytes, self.kp.sk, self._get_native_chain_id()
+        ).hex()
+
+    # -- document signing + chain-tx helpers -------------------------------
 
     def _build_and_sign(
         self,
         tool: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """SDK self-custodial doc signing primitive.
+        """Build and sign a THREAD document.
 
         Calls `thread.build_doc` with the tool + raw params, fetches the
         bridge-issued canonical bytes + replay-protection `doc_id_hex`,
@@ -442,9 +397,8 @@ class ThreadClient:
         }
 
     def _next_chain_nonce(self) -> int:
-        """Fetch the next-valid chain nonce for SDK self-custodial chain-tx
-        encoding. Returns 1 when the bridge has no chain RPC configured
-        (dev mode) — the legacy fallback in fetchNextNonce."""
+        """Fetch the next valid chain nonce for this agent. Returns 1 when the
+        bridge has no chain RPC configured (dev mode)."""
         if not self.agent_id_hex:
             self.agent_id_hex = _sha256(self.kp.pk_bytes).hex()
         try:
@@ -481,13 +435,13 @@ class ThreadClient:
         return {**result, "served_slot": str(slot), "your_pubkey_hex": self.kp.pubkey_hex}
 
     def register(self, description: str) -> dict[str, Any]:
-        """B.1.b M4 — SDK self-custodial register (bridge-as-mailroom).
-        Composes the three public sub-tools so the agent's seed never
-        leaves this process:
-          1. thread.scout                    — setix_code + capability_profile_id
-          2. thread.quick_register_challenge — challenge bytes + chain register-tx
-          3. SDK ed25519-signs both locally
-          4. thread.quick_register           — submit signatures + idempotency key
+        """Register this agent. Your key never leaves this process: the SDK
+        fetches a challenge, signs the challenge and the chain registration
+        transaction locally, and submits only the signatures.
+
+        Flow: scout (classify the description) -> request a challenge ->
+        sign the challenge and the chain registration transaction locally
+        -> submit the signatures.
         """
         setix_code = 0
         capability_profile_id = "general"
@@ -507,8 +461,13 @@ class ThreadClient:
         )
         challenge_bytes = bytes.fromhex(challenge_res["challenge_hex"])
         chain_tx_bytes = bytes.fromhex(challenge_res["chain_register_tx_bytes_hex"])
+        # The challenge is a bridge-issued nonce — sign it directly. The chain
+        # registration transaction is signed with chain-id domain separation,
+        # the same scheme as every other chain transaction.
         challenge_sig = self.kp.sk.sign(challenge_bytes)
-        chain_register_sig = self.kp.sk.sign(chain_tx_bytes)
+        chain_register_sig = sign_chain_tx_local(
+            chain_tx_bytes, self.kp.sk, self._get_native_chain_id()
+        )
         idempotency_key = secrets.token_bytes(32)
 
         reg, _ = self._invoke(
@@ -520,6 +479,7 @@ class ThreadClient:
                 "idempotency_key_hex": idempotency_key.hex(),
                 "challenge_hex": challenge_res["challenge_hex"],
                 "challenge_sig_hex": challenge_sig.hex(),
+                "chain_register_tx_bytes_hex": challenge_res["chain_register_tx_bytes_hex"],
                 "chain_register_sig_hex": chain_register_sig.hex(),
             },
         )
@@ -579,14 +539,8 @@ class ThreadClient:
         self,
         max_price_micro: int,
         setix_code: int | None = None,
-        origin_region: str | None = None,
     ) -> dict[str, Any]:
-        """Post a buyer offer.
-
-        origin_region: bridge region identifier (e.g., 'region-a').
-            Charset [a-z0-9-], 1–32 bytes. MANDATORY per SEC-004.
-            The bridge auto-fills its own region when omitted.
-        """
+        """Post a buyer offer."""
         sc = setix_code if setix_code is not None else self.setix_code
         if sc is None:
             raise ThreadError("Call register() first or pass setix_code explicitly")
@@ -594,13 +548,11 @@ class ThreadClient:
             "max_price_micro": str(max_price_micro),
             "setix_code": sc,
         }
-        if origin_region is not None:
-            build_params["origin_region"] = origin_region
         signed = self._build_and_sign("thread.post_offer", build_params)
         offer_id_hex = signed["extra_ids"].get("offer_id_hex")
         if not offer_id_hex:
             raise ThreadError("build_doc did not return offer_id_hex")
-        # Chain PostOffer: encode + sign inner-tx locally (bridge-as-mailroom).
+        # Chain PostOffer: encode + sign the inner transaction locally.
         nonce = self._next_chain_nonce()
         agent_id_bytes = _sha256(self.kp.pk_bytes)
         inner_bytes = encode_post_offer(
@@ -611,7 +563,7 @@ class ThreadClient:
             max_price_micro,
             nonce,
         )
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
         submit_params = self._pack_passthrough(
             {**build_params, "offer_id_hex": offer_id_hex},
             signed,
@@ -675,9 +627,10 @@ class ThreadClient:
             bytes.fromhex(bid_id_hex),
             bytes.fromhex(offer_id_hex),
             price,
+            quoted_latency_ms,
             nonce,
         )
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
         submit_params = self._pack_passthrough(
             {**build_params, "bid_id_hex": bid_id_hex},
             signed,
@@ -717,24 +670,20 @@ class ThreadClient:
         seller_id_hex: str,
         agreed_price_micro: int,
     ) -> dict[str, Any]:
-        """SDK visa-class self-custodial AcceptBid (mirrors post_offer/post_bid).
+        """Accept a bid (mirrors post_offer/post_bid).
 
-        ADR-2026-0046 Path A: escrow opens on the native COSR chain as part of
-        thread.accept_bid — no separate escrow-open call or envelope-only
-        sign_acceptance step. The bridge build_doc canonicalises §16.4
-        Acceptance; the SDK signs locally (cose_sign1_hex) and pre-signs the
-        chain AcceptBid inner-tx (chain_inner_sig_hex); the bridge forwards
-        both to chain ABCI as mailroom (ADR-2026-0224 D5+D6).
+        Escrow opens on the chain as part of accept_bid — there is no separate
+        escrow-open call. The bridge canonicalises the Acceptance document; the
+        SDK signs it locally (cose_sign1_hex) and also signs the chain AcceptBid
+        transaction locally (chain_inner_sig_hex); the bridge relays both.
         """
         build_params: dict[str, Any] = {
             "bid_id_hex": bid_id_hex,
             "seller_id_hex": seller_id_hex,
             "agreed_price_micro": str(agreed_price_micro),
             "offer_id_hex": offer_id_hex,
-            # Path A: chain-native escrow opens via accept_bid AcceptBid TX;
-            # the Solana-era escrow_tx_sig + escrow_pda fields in §16.4
-            # Acceptance are zero-filled placeholders (build_doc CBOR still
-            # carries field-8/9 for back-compat; chain ABCI ignores them).
+            # Escrow opens via the chain AcceptBid transaction; these two
+            # fields are unused placeholders kept for wire back-compat.
             "escrow_tx_sig_hex": "00" * 64,
             "escrow_pda_hex": "00" * 32,
         }
@@ -742,7 +691,7 @@ class ThreadClient:
         acceptance_id_hex = signed["extra_ids"].get("acceptance_id_hex") or secrets.token_bytes(32).hex()
 
         # Chain AcceptBid: encode + sign inner-tx locally.
-        # chain_escrow_id = sha256(bid_id) per ADR-2026-0046.
+        # chain_escrow_id = sha256(bid_id).
         nonce = self._next_chain_nonce()
         buyer_id_bytes = _sha256(self.kp.pk_bytes)
         bid_id_bytes = bytes.fromhex(bid_id_hex)
@@ -754,7 +703,7 @@ class ThreadClient:
             agreed_price_micro,
             nonce,
         )
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
         submit_params = self._pack_passthrough(
             {**build_params, "acceptance_id_hex": acceptance_id_hex},
             signed,
@@ -800,9 +749,9 @@ class ThreadClient:
     def submit_delivery(
         self, acceptance_id_hex: str, buyer_id_hex: str, output: str
     ) -> dict[str, Any]:
-        # B.1.b M4 — SDK self-custodial Delivery + chain SubmitDelivery.
-        # Bridge build_doc canonicalises §16.5 Delivery; SDK signs locally.
-        # Pre-flight resolves bid_id (chain_escrow_id = sha256(bid_id)).
+        # Build + sign the Delivery document and the chain SubmitDelivery
+        # transaction locally. Pre-flight resolves bid_id
+        # (chain_escrow_id = sha256(bid_id)).
         output_blob = output.encode("utf-8")
         output_hash = _sha256(output_blob)
         output_hash_hex = output_hash.hex()
@@ -833,7 +782,7 @@ class ThreadClient:
         inner_bytes = encode_submit_delivery(
             agent_id_bytes, chain_escrow_id, output_hash, nonce
         )
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
 
         submit_params = self._pack_passthrough(
             {
@@ -1012,7 +961,7 @@ class ThreadClient:
             filer_id_bytes,
             nonce,
         )
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
 
         submit_params = self._pack_passthrough(
             {**build_params, "dispute_id_hex": dispute_id_hex},
@@ -1027,17 +976,15 @@ class ThreadClient:
     # Bridge builds and signs COSE_Sign1 internally; no CBOR/COSE needed here.
 
     def accept_bid_hl(self, bid_id_hex: str) -> dict[str, Any]:
-        """B.1.b M4 (deprecation) — `accept_bid_hl(bid_id_hex)` relied on
-        bridge-side seed custody for bid-row lookup + acceptance signing.
-        That path required `secret_key_hex` transmission and is incompatible
-        with the visa-class non-custodial invariant (ADR-2026-0224 D5).
-        Migrate to `accept_bid(offer_id_hex, bid_id_hex, seller_id_hex,
+        """Deprecated. `accept_bid_hl(bid_id_hex)` required transmitting your
+        secret key to the bridge, which is incompatible with the non-custodial
+        design. Use `accept_bid(offer_id_hex, bid_id_hex, seller_id_hex,
         agreed_price_micro)` — those fields are visible to buyers via
         `query_bids(offer_id_hex)`."""
         raise ThreadError(
-            "accept_bid_hl is deprecated in B.1.b — use "
+            "accept_bid_hl is deprecated — use "
             "accept_bid(offer_id_hex, bid_id_hex, seller_id_hex, agreed_price_micro). "
-            "Fields come from query_bids(offer_id_hex). See ADR-2026-0224 D5."
+            "Fields come from query_bids(offer_id_hex)."
         )
 
     def submit_delivery_hl(
@@ -1046,8 +993,8 @@ class ThreadClient:
         output: str,
         output_uri: str | None = None,
     ) -> dict[str, Any]:
-        """B.1.b M4 — self-custodial. Resolves buyer_id via query_escrow,
-        delegates to the non-Hl `submit_delivery` flow."""
+        """Resolves buyer_id via query_escrow, then delegates to the
+        `submit_delivery` flow."""
         del output_uri  # captured by build_doc dispatcher via submit_delivery's params
         esc = self.query_escrow(acceptance_id_hex)
         buyer_id_hex = esc.get("buyer_id_hex")
@@ -1095,11 +1042,10 @@ class ThreadClient:
         delivery_id_hex: str | None = None,
         acceptance_id_hex: str | None = None,
     ) -> dict[str, Any]:
-        """B.1.b M4 — self-custodial settle. Resolves seller_id /
-        agreed_price / output_hash via query_escrow + poll_delivery,
-        bridge build_doc canonicalises §16.6 Settlement, SDK signs locally,
-        SDK encodes + signs chain Settle inner-tx locally. Zero
-        secret_key_hex transmission."""
+        """Settle a completed trade. Resolves seller_id / agreed_price /
+        output_hash via query_escrow + poll_delivery; the bridge canonicalises
+        the Settlement document; the SDK signs it locally and also signs the
+        chain Settle transaction locally."""
         if delivery_id_hex is None and acceptance_id_hex is None:
             raise ThreadError("settle_hl: provide delivery_id_hex or acceptance_id_hex")
 
@@ -1138,7 +1084,7 @@ class ThreadClient:
         agent_id_bytes = _sha256(self.kp.pk_bytes)
         chain_escrow_id = _sha256(bytes.fromhex(bid_id_hex))
         inner_bytes = encode_settle(agent_id_bytes, chain_escrow_id, nonce)
-        chain_inner_sig_hex = sign_chain_tx_local(inner_bytes, self.kp.sk).hex()
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
 
         submit_params = self._pack_passthrough(
             build_params, signed, chain_inner_sig_hex, nonce
@@ -1147,7 +1093,7 @@ class ThreadClient:
         return result or {}
 
     # -- Intent + Workflow Manifest methods ----------------------------------
-    # Bridge stubs ship at a prior version; handler wiring is a future platform cycle.
+    # These cover the declarative multi-step workflow surface.
 
     def broadcast_intent(
         self,
@@ -1262,8 +1208,7 @@ class ThreadClient:
         """BUYER: accept the solver's Workflow Manifest; unlocks sub-task marketplace.
         Intent moves to INTENT_ACTIVE. Returns {accepted, intent_id_hex, workflow_id_hex, status}.
 
-        B.1.b M4 — handler authorises via pubkey-derived agent_id; no
-        canonical doc to sign, so `agent_pubkey_hex` replaces `secret_key_hex`."""
+        No document to sign here; the handler authorises via your public key."""
         result, _ = self._invoke(
             "thread.accept_workflow_manifest",
             {
@@ -1322,9 +1267,8 @@ class ThreadClient:
             build_params["workflow_id_hex"] = workflow_id_hex
         if predicate_result_hex is not None:
             build_params["predicate_result_hex"] = predicate_result_hex
-        # B.1.b M4 — build_doc dispatcher does not yet cover
-        # thread.settle_workflow_manifest (supervisor extends at B.1.c).
-        # Fall back to agent_pubkey_hex submission when build_doc rejects.
+        # build_doc does not cover thread.settle_workflow_manifest yet; fall
+        # back to public-key submission when it is not dispatchable.
         try:
             signed = self._build_and_sign("thread.settle_workflow_manifest", build_params)
             submit_params = self._pack_passthrough(build_params, signed)
@@ -1348,9 +1292,7 @@ class ThreadClient:
         """File a dispute against a workflow step delivery.
         Returns {dispute_id_hex, status, assigned_oracle_hex}.
 
-        B.1.b M4 — orchestration call (no doc); handler authorises via
-        pubkey-derived agent_id. Replace `secret_key_hex` with
-        `agent_pubkey_hex` for the visa-class invariant."""
+        No document to sign here; the handler authorises via your public key."""
         result, _ = self._invoke(
             "thread.dispute_workflow_step",
             {
@@ -1644,11 +1586,8 @@ def auto_trade(
     return {"role": "seller", **result}
 
 
-# SEC-EXT-H04 (v0.2.250, CHUNK-EXT-15) — native chain-tx builders for the
-# gated `chain.*` / `market.*` MCP surface moved out of the bridge-served
-# public SDK into `platform/scripts/operator-sdk/setix_chain_builders.py`.
-# Public THREAD agents talk to `thread.*` HL tools only; raw chain access
-# remains available to operators via direct filesystem import.
+# This client speaks the public `thread.*` tools only. Privileged chain and
+# market operations are not part of the public surface.
 
 
 __all__ = [
