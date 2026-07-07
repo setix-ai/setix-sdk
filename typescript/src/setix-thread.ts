@@ -113,6 +113,29 @@ export class BridgeError extends ThreadError {
     }
 }
 
+/**
+ * The bridge accepted the signed document but the CHAIN write failed
+ * (non-zero chain result code). Write methods throw this instead of
+ * returning success-shaped ids, so a failed chain write is never silent.
+ *
+ * `chainCode` is the chain execution result code; `log` the chain's reason
+ * string; `errorToken` (when the bridge provides one) is the stable machine
+ * token for the failure class — e.g. `chain_offer_not_found` /
+ * `chain_offer_fills_exhausted` mean the listing you bid on left the market
+ * between query and write (listing staleness): re-run queryOffers and bid
+ * on another offer.
+ */
+export class ChainWriteError extends ThreadError {
+    constructor(
+        public readonly tool: string,
+        public readonly chainCode: number,
+        public readonly log: string,
+        public readonly errorToken?: string,
+    ) {
+        super(`${tool}: chain write failed (code=${chainCode})${errorToken ? ` [${errorToken}]` : ''}: ${log}`);
+    }
+}
+
 // ---- canonical CBOR + crypto helpers --------------------------------------
 
 function enc(value: unknown): Uint8Array {
@@ -290,6 +313,26 @@ export class ThreadClient {
     }
 
     /**
+     * Throw ChainWriteError when a write result carries a non-zero chain
+     * code. The bridge's write envelope is {accepted, document_tag, ...,
+     * chain_result?: {code, log, error_token?}} — `accepted: true` means the
+     * DOCUMENT was accepted; the chain write's fate rides in chain_result.
+     * Absence of chain_result is not failure (no chain submit ran).
+     */
+    private checkChainResult(tool: string, result: unknown): unknown {
+        if (result && typeof result === 'object') {
+            const r = result as Record<string, unknown>;
+            const cr = (r['chain_result'] ?? r['chain_tx_result']) as
+                | { code?: number; log?: string; error_token?: string }
+                | undefined;
+            if (cr && typeof cr === 'object' && (cr.code ?? 0) !== 0) {
+                throw new ChainWriteError(tool, cr.code ?? -1, cr.log ?? 'unknown', cr.error_token);
+            }
+        }
+        return result;
+    }
+
+    /**
      * Build and sign a THREAD document.
      *
      * Calls `thread.build_doc` with the requested tool + raw params,
@@ -408,6 +451,30 @@ export class ThreadClient {
         return id;
     }
 
+    /** The serving bridge's region id (from platform_health), cached. Used
+     *  as the external-AAD audience binding on observe-auth COSE envelopes
+     *  so they cannot be replayed against another region. */
+    private _platformRegionId: string | null = null;
+    private async getPlatformRegion(): Promise<string | undefined> {
+        if (this._platformRegionId !== null) return this._platformRegionId;
+        const health = await this.platformHealth();
+        const region = (health as Record<string, unknown>)['region'];
+        if (typeof region === 'string' && region.length > 0) {
+            this._platformRegionId = region;
+            return region;
+        }
+        return undefined;
+    }
+
+    /** Build the non-custodial observe-auth proof: a client-built COSE_Sign1
+     *  over the tool name, region-bound via external AAD. The private key
+     *  never leaves this process. */
+    private async observeAuthCoseHex(tool: string): Promise<string> {
+        const region = await this.getPlatformRegion();
+        const envelope = signCose(new TextEncoder().encode(tool), this.kp.privateKey, this.kp.publicKey, region);
+        return Buffer.from(envelope).toString('hex');
+    }
+
     async register(description: string): Promise<{ agentIdHex: string; setixCode: number; pubkeyHex: string }> {
         // Register this agent. Your key never leaves this process: the SDK
         // fetches a challenge, signs the challenge and the chain registration
@@ -458,10 +525,7 @@ export class ThreadClient {
             agent_id_hex: string;
             chain_tx_result?: { code: number; log: string } | null;
         };
-        const chainResult = reg.chain_tx_result;
-        if (chainResult && chainResult.code !== 0) {
-            throw new ThreadError(`chain registration failed: ${chainResult.log}`);
-        }
+        this.checkChainResult('thread.quick_register', regRes);
         this.setixCode = setixCode;
         this.agentIdHex = reg.agent_id_hex;
         this.saveMeta();
@@ -489,6 +553,7 @@ export class ThreadClient {
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         if (args.effectiveSlotOffset !== undefined) submitParams['effective_slot_offset'] = args.effectiveSlotOffset;
         const { result } = await this.invoke('thread.publish_spend_policy', submitParams);
+        this.checkChainResult('thread.publish_spend_policy', result);
         const r = result as { policy_id_hex: string; version: number; effective_slot: string };
         return { policyIdHex: r.policy_id_hex, version: r.version, effectiveSlot: r.effective_slot };
     }
@@ -525,7 +590,8 @@ export class ThreadClient {
             chainInnerSigHex,
             nonce,
         });
-        await this.invoke('thread.post_offer', submitParams);
+        const { result: postOfferRes } = await this.invoke('thread.post_offer', submitParams);
+        this.checkChainResult('thread.post_offer', postOfferRes);
         return { offerIdHex };
     }
 
@@ -584,7 +650,8 @@ export class ThreadClient {
             chainInnerSigHex,
             nonce,
         });
-        await this.invoke('thread.post_bid', submitParams);
+        const { result: postBidRes } = await this.invoke('thread.post_bid', submitParams);
+        this.checkChainResult('thread.post_bid', postBidRes);
         return { bidIdHex };
     }
 
@@ -652,6 +719,7 @@ export class ThreadClient {
             nonce,
         });
         const { result } = await this.invoke('thread.accept_bid', submitParams);
+        this.checkChainResult('thread.accept_bid', result);
         const r = result as { acceptance_id_hex?: string };
         return { acceptanceIdHex: r.acceptance_id_hex ?? acceptanceIdHex };
     }
@@ -665,15 +733,114 @@ export class ThreadClient {
         }
     }
 
+    // -- seller wake (thread.await_owner_events long-poll) ------------------
+
+    /** Bridge-enforced ceiling on a single awaitOwnerEvents block (ms). The
+     *  cap keeps each call under the public edge-proxy ceiling (~30s); loop
+     *  the call (or use waitForOwnerEvent) for longer waits. */
+    static readonly AWAIT_OWNER_EVENTS_MAX_WAIT_MS = 25_000;
+
+    /**
+     * ONE server-side-blocking wait for an owner-event addressed to YOUR
+     * agent_id (the seller-wake path for one-shot agents — replaces
+     * stay-alive polling). Blocks up to maxWaitMs (default 20s, clamped by
+     * the bridge to [1s, 25s]) and returns the bridge result:
+     * {agent_id_hex, events: [...], timed_out, waited_ms, ...}.
+     *
+     * Contract: FUTURE events only — always reconcile state first
+     * (query_escrow_by_bid / query_bids / poll_delivery); a timed-out wait
+     * ({timed_out: true, events: []}) is NORMAL — reconcile and call again
+     * (waitForOwnerEvent does this loop for you). One wake channel per
+     * agent. `kinds` filters which event kinds resolve the wait, e.g.
+     * ['bid_accepted'] while waiting to deliver, ['escrow_settled'] while
+     * waiting to be paid.
+     *
+     * Auth: a client-built COSE_Sign1 identity proof (cose_sign1_hex) —
+     * non-custodial on every realm; your private key never leaves this
+     * process. Register first (the bridge resolves your pubkey from your
+     * registered agent identity).
+     */
+    async awaitOwnerEvents(opts: { kinds?: string[]; maxWaitMs?: number } = {}): Promise<Record<string, unknown>> {
+        const raw = opts.maxWaitMs ?? 20_000;
+        const params: Record<string, unknown> = {
+            cose_sign1_hex: await this.observeAuthCoseHex('thread.await_owner_events'),
+            max_wait_ms: Math.min(Math.max(Math.floor(raw), 1_000), ThreadClient.AWAIT_OWNER_EVENTS_MAX_WAIT_MS),
+        };
+        if (opts.kinds && opts.kinds.length > 0) params['kinds'] = opts.kinds;
+        try {
+            const { result } = await this.invoke('thread.await_owner_events', params);
+            return (result ?? {}) as Record<string, unknown>;
+        } catch (e) {
+            if (!(e instanceof BridgeError) || !String(e.message).includes('cose_sign1_hex verification failed')) throw e;
+            // Region-AAD mismatch (a geo-routed edge can serve consecutive
+            // calls from different regions): re-learn the region, retry once.
+            this._platformRegionId = null;
+            params['cose_sign1_hex'] = await this.observeAuthCoseHex('thread.await_owner_events');
+            const { result } = await this.invoke('thread.await_owner_events', params);
+            return (result ?? {}) as Record<string, unknown>;
+        }
+    }
+
+    /**
+     * Loop awaitOwnerEvents until one of `kinds` arrives or timeout. Returns
+     * the first matching decoded event ({event_kind, offer_id_hex?,
+     * bid_id_hex?, acceptance_id_hex?, ...}). Throws ThreadError on timeout.
+     * NB: covers FUTURE events only — reconcile current state BEFORE calling
+     * (an event that fired before the loop started will never arrive here).
+     */
+    async waitForOwnerEvent(kinds: string[], opts: { timeoutMs?: number } = {}): Promise<Record<string, unknown>> {
+        const timeoutMs = opts.timeoutMs ?? 300_000;
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const remainingMs = deadline - Date.now();
+            if (remainingMs < 1_000) break;
+            const result = await this.awaitOwnerEvents({
+                kinds,
+                maxWaitMs: Math.min(remainingMs, ThreadClient.AWAIT_OWNER_EVENTS_MAX_WAIT_MS),
+            });
+            const events = (result['events'] ?? []) as Record<string, unknown>[];
+            if (events.length > 0) return events[0]!;
+        }
+        throw new ThreadError(`waitForOwnerEvent timed out after ${timeoutMs}ms waiting for ${kinds.join(',')}`);
+    }
+
+    /**
+     * Seller-side: wait until a buyer accepts your bid. Returns the escrow
+     * record with acceptance_id_hex and buyer_id_hex once matched. Throws on
+     * timeout.
+     *
+     * Uses the legible seller loop: reconcile state (query_escrow_by_bid) →
+     * block on awaitOwnerEvents({kinds: ['bid_accepted']}) → reconcile again.
+     * Falls back to plain 1s polling when the bridge does not serve
+     * await_owner_events (older bridges).
+     */
     async waitForAcceptance(bidIdHex: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<Record<string, unknown>> {
         const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
         const poll = opts.pollMs ?? 1000;
+        let wakeAvailable = true;
         while (Date.now() < deadline) {
+            // 1) Reconcile first — await covers FUTURE events only.
             try {
                 const { result } = await this.invoke('thread.query_escrow_by_bid', { bid_id_hex: bidIdHex });
                 const r = result as { acceptance_id_hex?: string };
                 if (r && r.acceptance_id_hex) return result as Record<string, unknown>;
-            } catch { /* keep polling */ }
+            } catch { /* reconcile again next cycle */ }
+            // 2) Block on the wake channel (costs nothing while waiting);
+            //    fall back to sleep-polling if the wake path is unavailable.
+            if (wakeAvailable) {
+                try {
+                    const remainingMs = deadline - Date.now();
+                    if (remainingMs >= 1_000) {
+                        await this.awaitOwnerEvents({
+                            kinds: ['bid_accepted'],
+                            maxWaitMs: Math.min(remainingMs, ThreadClient.AWAIT_OWNER_EVENTS_MAX_WAIT_MS),
+                        });
+                    }
+                    continue;
+                } catch {
+                    wakeAvailable = false;
+                }
+            }
             await new Promise<void>((r) => setTimeout(r, poll));
         }
         throw new ThreadError(`waitForAcceptance timed out after ${opts.timeoutMs ?? 120000}ms`);
@@ -735,7 +902,8 @@ export class ThreadClient {
             chainInnerSigHex,
             nonce,
         });
-        await this.invoke('thread.submit_delivery', submitParams);
+        const { result: submitDeliveryRes } = await this.invoke('thread.submit_delivery', submitParams);
+        this.checkChainResult('thread.submit_delivery', submitDeliveryRes);
         return { deliveryIdHex, outputHashHex };
     }
 
@@ -894,6 +1062,7 @@ export class ThreadClient {
             nonce,
         });
         const { result } = await this.invoke('thread.file_dispute', submitParams);
+        this.checkChainResult('thread.file_dispute', result);
         const r = result as { dispute_id_hex: string; status: string; assigned_oracle_hex: string | null };
         return {
             disputeIdHex: r.dispute_id_hex,
@@ -1051,6 +1220,7 @@ export class ThreadClient {
             nonce,
         });
         const { result } = await this.invoke('thread.settle', submitParams);
+        this.checkChainResult('thread.settle', result);
         return result as Record<string, unknown>;
     }
 
@@ -1082,6 +1252,7 @@ export class ThreadClient {
         const signed = await this.buildAndSign('thread.broadcast_intent', buildParams);
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         const { result } = await this.invoke('thread.broadcast_intent', submitParams);
+        this.checkChainResult('thread.broadcast_intent', result);
         const r = result as { intent_id_hex: string; status: string; escrow_tx_hex: string };
         return { intentIdHex: r.intent_id_hex, status: r.status, escrowTxHex: r.escrow_tx_hex };
     }
@@ -1103,6 +1274,7 @@ export class ThreadClient {
         const signed = await this.buildAndSign('thread.respond_to_intent', buildParams);
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         const { result } = await this.invoke('thread.respond_to_intent', submitParams);
+        this.checkChainResult('thread.respond_to_intent', result);
         const r = result as { claim_id_hex: string; intent_id_hex: string; status: string; bond_locked_micro: string };
         return { claimIdHex: r.claim_id_hex, intentIdHex: r.intent_id_hex, status: r.status, bondLockedMicro: r.bond_locked_micro };
     }
@@ -1132,6 +1304,7 @@ export class ThreadClient {
         const signed = await this.buildAndSign('thread.compose_workflow_manifest', buildParams);
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         const { result } = await this.invoke('thread.compose_workflow_manifest', submitParams);
+        this.checkChainResult('thread.compose_workflow_manifest', result);
         const r = result as { workflow_id_hex: string; manifest_hash_hex: string; status: string };
         return { workflowIdHex: r.workflow_id_hex, manifestHashHex: r.manifest_hash_hex, status: r.status };
     }
@@ -1149,6 +1322,7 @@ export class ThreadClient {
             intent_id_hex: args.intentIdHex,
             claim_id_hex: args.claimIdHex,
         });
+        this.checkChainResult('thread.accept_workflow_manifest', result);
         const r = result as { accepted: boolean; intent_id_hex: string; workflow_id_hex: string; status: string };
         return { accepted: r.accepted, intentIdHex: r.intent_id_hex, workflowIdHex: r.workflow_id_hex, status: r.status };
     }
@@ -1173,6 +1347,7 @@ export class ThreadClient {
         const signed = await this.buildAndSign('thread.submit_workflow_step_delivery', buildParams);
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         const { result } = await this.invoke('thread.submit_workflow_step_delivery', submitParams);
+        this.checkChainResult('thread.submit_workflow_step_delivery', result);
         const r = result as { frame_id_hex: string; status: string; sequence: number; accumulator_root_hex: string };
         return { frameIdHex: r.frame_id_hex, status: r.status, sequence: r.sequence, accumulatorRootHex: r.accumulator_root_hex };
     }
@@ -1207,6 +1382,7 @@ export class ThreadClient {
             submitParams = { ...buildParams, agent_pubkey_hex: this.kp.pubkeyHex };
         }
         const { result } = await this.invoke('thread.settle_workflow_manifest', submitParams);
+        this.checkChainResult('thread.settle_workflow_manifest', result);
         const r = result as {
             nested_settlement_id_hex: string; status: string;
             total_cosr_released: string; total_cosr_refunded: string; solver_profit_micro: string;
@@ -1242,6 +1418,7 @@ export class ThreadClient {
             evidence_bond_micro: (args.evidenceBondMicro ?? 100_000n).toString(),
         };
         const { result } = await this.invoke('thread.dispute_workflow_step', params);
+        this.checkChainResult('thread.dispute_workflow_step', result);
         const r = result as { dispute_id_hex: string; status: string; assigned_oracle_hex: string | null };
         return { disputeIdHex: r.dispute_id_hex, status: r.status, assignedOracleHex: r.assigned_oracle_hex ?? null };
     }

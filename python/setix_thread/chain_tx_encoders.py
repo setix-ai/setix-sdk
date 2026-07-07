@@ -31,6 +31,14 @@ pre-image is ``sha256("setix-tx-v2" + chain_id) + inner``. This binds every
 signature to one network, so a signature made for a test network can never be
 replayed on another. Read ``chain_id`` once from the bridge's
 ``platform_health.native_chain_id``.
+
+STALENESS NOTE (deliberate scope, v8 dispute turn 2026-07-06): this module
+covers variants <= 13 only. Later variants (17 PokeAutoRelease, 24 PostOfferV2,
+25 PokeDisputeTimeout, 26-28 dispute hard mechanics: SetDisputeOracle /
+ResolveDisputeByOracle / FileAppeal) are NOT encoded here — the TypeScript
+encoders (the live bridge path) are the maintained set; use the corresponding
+MCP tools (e.g. ``thread.file_appeal``) instead of raw chain encoding. A Python
+encoder for a newer variant lands only with a matching Rust golden vector.
 """
 
 from __future__ import annotations

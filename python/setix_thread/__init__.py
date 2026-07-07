@@ -125,6 +125,28 @@ class BridgeError(ThreadError):
         self.message = message
 
 
+class ChainWriteError(ThreadError):
+    """The bridge accepted the signed document but the CHAIN write failed
+    (non-zero chain result code). Write methods raise this instead of
+    returning success-shaped ids, so a failed chain write is never silent.
+
+    `code` is the chain execution result code; `log` the chain's reason
+    string; `error_token` (when the bridge provides one) is the stable
+    machine token for the failure class — e.g. `chain_offer_not_found` /
+    `chain_offer_fills_exhausted` mean the listing you bid on left the
+    market between query and write (listing staleness): re-run
+    query_offers and bid on another offer.
+    """
+
+    def __init__(self, tool: str, code: int, log: str, error_token: str | None = None):
+        token_part = f" [{error_token}]" if error_token else ""
+        super().__init__(f"{tool}: chain write failed (code={code}){token_part}: {log}")
+        self.tool = tool
+        self.chain_code = code
+        self.log = log
+        self.error_token = error_token
+
+
 # ---- canonical CBOR helpers -----------------------------------------------
 
 
@@ -281,6 +303,7 @@ class ThreadClient:
         self.setix_code: int | None = None
         self.agent_id_hex: str | None = None
         self._native_chain_id: str | None = None
+        self._platform_region_id: str | None = None
         self._load_meta()
 
     # -- meta cache ---------------------------------------------------------
@@ -318,6 +341,23 @@ class ThreadClient:
             raise BridgeError(code, message)
         return body.get("result"), served_slot
 
+    def _check_chain_result(self, tool: str, result: Any) -> Any:
+        """Raise ChainWriteError when a write result carries a non-zero chain
+        code. The bridge's write envelope is {accepted, document_tag, ...,
+        chain_result?: {code, log, error_token?}} — `accepted: true` means the
+        DOCUMENT was accepted; the chain write's fate rides in chain_result.
+        Absence of chain_result is not failure (no chain submit ran)."""
+        if isinstance(result, dict):
+            cr = result.get("chain_result") or result.get("chain_tx_result")
+            if isinstance(cr, dict) and cr.get("code", 0) != 0:
+                raise ChainWriteError(
+                    tool,
+                    int(cr.get("code", -1)),
+                    str(cr.get("log", "unknown")),
+                    cr.get("error_token"),
+                )
+        return result
+
     def _fresh_slot(self) -> int:
         _, slot = self._invoke("thread.platform_health", {})
         return slot
@@ -335,6 +375,24 @@ class ThreadClient:
                 )
             self._native_chain_id = cid
         return self._native_chain_id
+
+    def _platform_region(self) -> str | None:
+        """The serving bridge's region id (from platform_health), cached.
+        Used as the external-AAD audience binding on observe-auth COSE
+        envelopes so they cannot be replayed against another region."""
+        if self._platform_region_id is None:
+            result, _ = self._invoke("thread.platform_health", {})
+            self._platform_region_id = result.get("region")
+        return self._platform_region_id
+
+    def _observe_auth_cose_hex(self, tool: str) -> str:
+        """Build the non-custodial observe-auth proof: a client-built
+        COSE_Sign1 over the tool name, region-bound via external AAD. The
+        private key never leaves this process."""
+        region = self._platform_region()
+        return _sign_cose(
+            tool.encode("utf-8"), self.kp.sk, self.kp.pk_bytes, region
+        ).hex()
 
     def _sign_chain(self, inner_bytes: bytes) -> str:
         """Sign chain inner bytes locally with chain-id domain separation and
@@ -483,11 +541,7 @@ class ThreadClient:
                 "chain_register_sig_hex": chain_register_sig.hex(),
             },
         )
-        chain_result = reg.get("chain_tx_result") or {}
-        if chain_result.get("code", 0) != 0:
-            raise ThreadError(
-                f"chain registration failed: {chain_result.get('log', 'unknown')}"
-            )
+        self._check_chain_result("thread.quick_register", reg)
         self.agent_id_hex = reg["agent_id_hex"]
         self.setix_code = setix_code
         self._save_meta()
@@ -529,6 +583,7 @@ class ThreadClient:
         if effective_slot_offset is not None:
             submit_params["effective_slot_offset"] = effective_slot_offset
         result, _ = self._invoke("thread.publish_spend_policy", submit_params)
+        self._check_chain_result("thread.publish_spend_policy", result)
         return {
             "policy_id_hex": result["policy_id_hex"],
             "version": result["version"],
@@ -570,7 +625,8 @@ class ThreadClient:
             chain_inner_sig_hex,
             nonce,
         )
-        self._invoke("thread.post_offer", submit_params)
+        result, _ = self._invoke("thread.post_offer", submit_params)
+        self._check_chain_result("thread.post_offer", result)
         return {
             "offer_id_hex": offer_id_hex,
             "setix_code": sc,
@@ -637,7 +693,8 @@ class ThreadClient:
             chain_inner_sig_hex,
             nonce,
         )
-        self._invoke("thread.post_bid", submit_params)
+        result, _ = self._invoke("thread.post_bid", submit_params)
+        self._check_chain_result("thread.post_bid", result)
         return {
             "bid_id_hex": bid_id_hex,
             "offer_id_hex": offer_id_hex,
@@ -711,6 +768,7 @@ class ThreadClient:
             nonce,
         )
         result, _ = self._invoke("thread.accept_bid", submit_params)
+        self._check_chain_result("thread.accept_bid", result)
         return {
             "acceptance_id_hex": result.get("acceptance_id_hex", acceptance_id_hex),
             "offer_id_hex": offer_id_hex,
@@ -725,16 +783,102 @@ class ThreadClient:
         )
         return result or {}
 
+    # -- seller wake (thread.await_owner_events long-poll) ------------------
+
+    #: Bridge-enforced ceiling on a single await_owner_events block (ms). The
+    #: cap keeps each call under the public edge-proxy ceiling (~30s); loop
+    #: the call (or use wait_for_owner_event) for longer waits.
+    AWAIT_OWNER_EVENTS_MAX_WAIT_MS = 25_000
+
+    def await_owner_events(
+        self,
+        kinds: list[str] | None = None,
+        max_wait_ms: int = 20_000,
+    ) -> dict[str, Any]:
+        """ONE server-side-blocking wait for an owner-event addressed to YOUR
+        agent_id (the seller-wake path for one-shot agents — replaces
+        stay-alive polling). Blocks up to `max_wait_ms` (default 20s, clamped
+        by the bridge to [1s, 25s]) and returns the bridge result:
+        {agent_id_hex, events: [...], timed_out, waited_ms, ...}.
+
+        Contract: FUTURE events only — always reconcile state first
+        (query_escrow_by_bid / query_bids / poll_delivery); a timed-out wait
+        ({timed_out: True, events: []}) is NORMAL — reconcile and call again
+        (wait_for_owner_event does this loop for you). One wake channel per
+        agent. `kinds` filters which event kinds resolve the wait, e.g.
+        ["bid_accepted"] while waiting to deliver, ["escrow_settled"] while
+        waiting to be paid.
+
+        Auth: a client-built COSE_Sign1 identity proof (cose_sign1_hex) —
+        non-custodial on every realm; your private key never leaves this
+        process. Register first (the bridge resolves your pubkey from your
+        registered agent identity).
+        """
+        params: dict[str, Any] = {
+            "cose_sign1_hex": self._observe_auth_cose_hex("thread.await_owner_events"),
+            "max_wait_ms": min(max(int(max_wait_ms), 1_000), self.AWAIT_OWNER_EVENTS_MAX_WAIT_MS),
+        }
+        if kinds:
+            params["kinds"] = kinds
+        try:
+            result, _ = self._invoke("thread.await_owner_events", params)
+        except BridgeError as e:
+            if "cose_sign1_hex verification failed" not in str(e):
+                raise
+            # Region-AAD mismatch (a geo-routed edge can serve consecutive
+            # calls from different regions): re-learn the region, retry once.
+            self._platform_region_id = None
+            params["cose_sign1_hex"] = self._observe_auth_cose_hex(
+                "thread.await_owner_events"
+            )
+            result, _ = self._invoke("thread.await_owner_events", params)
+        return result or {}
+
+    def wait_for_owner_event(
+        self,
+        kinds: list[str],
+        timeout_sec: float = 300.0,
+    ) -> dict[str, Any]:
+        """Loop await_owner_events until one of `kinds` arrives or timeout.
+        Returns the first matching decoded event dict ({event_kind,
+        offer_id_hex?, bid_id_hex?, acceptance_id_hex?, ...}). Raises
+        ThreadError on timeout. NB: covers FUTURE events only — reconcile
+        current state BEFORE calling (an event that fired before the loop
+        started will never arrive here)."""
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms < 1_000:
+                break
+            result = self.await_owner_events(
+                kinds=kinds,
+                max_wait_ms=min(remaining_ms, self.AWAIT_OWNER_EVENTS_MAX_WAIT_MS),
+            )
+            events = result.get("events") or []
+            if events:
+                return events[0]
+        raise ThreadError(
+            f"wait_for_owner_event timed out after {timeout_sec}s waiting for {kinds}"
+        )
+
     def wait_for_acceptance(
         self,
         bid_id_hex: str,
         timeout_sec: float = 120.0,
         poll_interval_sec: float = 1.0,
     ) -> dict[str, Any]:
-        """Seller-side: poll until a buyer accepts your bid. Returns acceptance dict
-        with acceptance_id_hex and buyer_id_hex once matched. Raises on timeout."""
+        """Seller-side: wait until a buyer accepts your bid. Returns the
+        escrow dict with acceptance_id_hex and buyer_id_hex once matched.
+        Raises on timeout.
+
+        Uses the legible seller loop: reconcile state (query_escrow_by_bid)
+        → block on await_owner_events(kinds=["bid_accepted"]) → reconcile
+        again. Falls back to plain 1s polling when the bridge does not serve
+        await_owner_events (older bridges)."""
         deadline = time.monotonic() + timeout_sec
+        wake_available = True
         while time.monotonic() < deadline:
+            # 1) Reconcile first — await covers FUTURE events only.
             try:
                 result, _ = self._invoke(
                     "thread.query_escrow_by_bid", {"bid_id_hex": bid_id_hex}
@@ -743,6 +887,21 @@ class ThreadClient:
                     return result
             except BridgeError:
                 pass
+            # 2) Block on the wake channel (costs nothing while waiting);
+            #    fall back to sleep-polling if the wake path is unavailable.
+            if wake_available:
+                try:
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms >= 1_000:
+                        self.await_owner_events(
+                            kinds=["bid_accepted"],
+                            max_wait_ms=min(
+                                remaining_ms, self.AWAIT_OWNER_EVENTS_MAX_WAIT_MS
+                            ),
+                        )
+                    continue
+                except (BridgeError, ThreadError):
+                    wake_available = False
             time.sleep(poll_interval_sec)
         raise ThreadError(f"wait_for_acceptance timed out after {timeout_sec}s")
 
@@ -796,7 +955,8 @@ class ThreadClient:
             chain_inner_sig_hex,
             nonce,
         )
-        self._invoke("thread.submit_delivery", submit_params)
+        result, _ = self._invoke("thread.submit_delivery", submit_params)
+        self._check_chain_result("thread.submit_delivery", result)
         return {
             "delivery_id_hex": delivery_id_hex,
             "output_hash_hex": output_hash_hex,
@@ -970,6 +1130,7 @@ class ThreadClient:
             nonce,
         )
         result, _ = self._invoke("thread.file_dispute", submit_params)
+        self._check_chain_result("thread.file_dispute", result)
         return result or {}
 
     # -- high-level (HL) methods — v0.1.37 ----------------------------------
@@ -1090,6 +1251,7 @@ class ThreadClient:
             build_params, signed, chain_inner_sig_hex, nonce
         )
         result, _ = self._invoke("thread.settle", submit_params)
+        self._check_chain_result("thread.settle", result)
         return result or {}
 
     # -- Intent + Workflow Manifest methods ----------------------------------
@@ -1128,6 +1290,7 @@ class ThreadClient:
         signed = self._build_and_sign("thread.broadcast_intent", build_params)
         submit_params = self._pack_passthrough(build_params, signed)
         result, _ = self._invoke("thread.broadcast_intent", submit_params)
+        self._check_chain_result("thread.broadcast_intent", result)
         return result or {}
 
     def respond_to_intent(
@@ -1150,6 +1313,7 @@ class ThreadClient:
         signed = self._build_and_sign("thread.respond_to_intent", build_params)
         submit_params = self._pack_passthrough(build_params, signed)
         result, _ = self._invoke("thread.respond_to_intent", submit_params)
+        self._check_chain_result("thread.respond_to_intent", result)
         return result or {}
 
     def compose_workflow_manifest(
@@ -1197,6 +1361,7 @@ class ThreadClient:
         signed = self._build_and_sign("thread.compose_workflow_manifest", build_params)
         submit_params = self._pack_passthrough(build_params, signed)
         result, _ = self._invoke("thread.compose_workflow_manifest", submit_params)
+        self._check_chain_result("thread.compose_workflow_manifest", result)
         return result or {}
 
     def accept_workflow_manifest(
@@ -1217,6 +1382,7 @@ class ThreadClient:
                 "claim_id_hex": claim_id_hex,
             },
         )
+        self._check_chain_result("thread.accept_workflow_manifest", result)
         return result or {}
 
     def submit_workflow_step_delivery(
@@ -1243,6 +1409,7 @@ class ThreadClient:
         signed = self._build_and_sign("thread.submit_workflow_step_delivery", build_params)
         submit_params = self._pack_passthrough(build_params, signed)
         result, _ = self._invoke("thread.submit_workflow_step_delivery", submit_params)
+        self._check_chain_result("thread.submit_workflow_step_delivery", result)
         return result or {}
 
     def settle_workflow_manifest(
@@ -1277,6 +1444,7 @@ class ThreadClient:
                 raise
             submit_params = {**build_params, "agent_pubkey_hex": self.kp.pubkey_hex}
         result, _ = self._invoke("thread.settle_workflow_manifest", submit_params)
+        self._check_chain_result("thread.settle_workflow_manifest", result)
         return result or {}
 
     def dispute_workflow_step(
@@ -1305,6 +1473,7 @@ class ThreadClient:
                 "evidence_bond_micro": str(evidence_bond_micro),
             },
         )
+        self._check_chain_result("thread.dispute_workflow_step", result)
         return result or {}
 
 
