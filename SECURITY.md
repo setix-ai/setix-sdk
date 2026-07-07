@@ -12,42 +12,32 @@ Please do not file public GitHub issues for security bugs.
 
 Every release of `@setix/thread` (npm) and `setix-thread` (PyPI) is:
 
-1. Built from a tagged commit in this repository.
-2. Signed with the founder-personal Ed25519 release key (transitions to the Setix Foundation attestation key after v1.0.0).
-3. Mirrored in a SHA-256 release manifest at <https://setix.ai/.well-known/sdk-integrity.json>.
-4. Published with npm provenance (TypeScript) and PyPI Trusted Publishing (Python). The provenance attestations are anchored in sigstore's public transparency log; both are verifiable independently of this repository.
+1. Built from a **signed tag** in this repository (Ed25519; founder-personal key until v1.0.0, transitioning to the Setix Foundation attestation key after).
+2. Published with **npm provenance** (TypeScript) and **PyPI Trusted Publishing** (Python). The provenance attestations are anchored in sigstore's public transparency log; both are verifiable independently of this repository.
+3. Accompanied by **sigstore-signed artifact bundles** attached to the GitHub Release for the tag.
 
 ### Verifying a downloaded artifact
 
-After installing, compare the file hashes against the release manifest at <https://setix.ai/.well-known/sdk-integrity.json>:
-
 ```bash
-# TypeScript
+# TypeScript — verify the npm provenance attestation chain:
+npm audit signatures
+
+# Inspect the published dist integrity fields:
 npm view @setix/thread@<version> --json | jq -r '.dist'
 
-# Python
+# Python — PyPI Trusted Publishing binds the artifact to this repository's
+# release workflow; download and hash for cross-checking against the
+# GitHub Release's sigstore bundle:
 pip download setix-thread==<version> --no-deps -d /tmp/setix-thread
 sha256sum /tmp/setix-thread/*.whl
 ```
 
-The integrity endpoint serves an array of records, one per release:
+A machine-readable per-release SHA-256 manifest additionally serves at
+<https://mcp.setix.dev/.well-known/sdk-integrity.json> (rows are being
+backfilled for the `0.0.x` releases; sigstore + provenance above are the
+authoritative verification path while the band is pre-1.0).
 
-```json
-{
-  "sdk_integrity_manifest": [
-    {
-      "tag": "v0.0.X",
-      "files": [{ "path": "...", "sha256": "..." }],
-      "signed_by": "founder-personal",
-      "signed_at_slot": 0
-    }
-  ],
-  "setix_foundation_attestation_pubkey_hex": "<hex>",
-  "scope": "v0.0.x"
-}
-```
-
-If a downloaded artifact's hash does NOT match the published manifest, do not use it — open a vulnerability report.
+If a downloaded artifact fails provenance verification or its hash does not match the release's signed bundle, do not use it — open a vulnerability report.
 
 ## Release signing key
 
