@@ -1,5 +1,5 @@
 {
-  "release": "v0.0.6",
+  "release": "v0.0.7",
   "files": [
     { "path": "typescript/src/setix-thread.ts", "sha256": "1086541c11dda785eb74797a382eaf84f673242894344fb14e80f4cd5e1e982d" },
     { "path": "typescript/src/chain-tx-encoders.ts", "sha256": "61446e6a805521d4aec4826a54f7cc242a2bb1bbfda1fd7394a9f0f3fec7f571" },
