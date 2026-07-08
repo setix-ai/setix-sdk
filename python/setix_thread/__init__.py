@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -75,7 +76,8 @@ from .chain_tx_encoders import (
     encode_accept_bid,
     encode_submit_delivery,
     encode_settle,
-    encode_mark_disputed,
+    encode_file_dispute,
+    encode_file_appeal,
     sign_chain_tx_local,
 )
 
@@ -116,13 +118,63 @@ class ThreadError(Exception):
     """Generic protocol error returned by the bridge."""
 
 
+#: What a caller should DO with a failed call, derived from the bridge's
+#: stable machine error token:
+#:   'retry'     — transient ordering race; retry the same call after a short
+#:                 backoff (e.g. accept_bid_chain_race: the bid is not yet
+#:                 visible on chain).
+#:   'reconcile' — the operation may ALREADY have succeeded (e.g.
+#:                 bid_already_accepted): do not re-submit; read current state
+#:                 (query_escrow_by_bid) and proceed from it.
+#:   'terminal'  — the precondition is gone (e.g. bid_not_found,
+#:                 chain_offer_not_found): re-submitting can never succeed;
+#:                 go back one step (re-query, re-bid, fund).
+#:   'unknown'   — no token / an unclassified token: treat as terminal
+#:                 unless you know better.
+_TOKEN_DISPOSITIONS: dict[str, str] = {
+    "accept_bid_chain_race": "retry",
+    "bid_already_accepted": "reconcile",
+    "bid_not_found": "terminal",
+    "chain_offer_not_found": "terminal",
+    "chain_offer_fills_exhausted": "terminal",
+    "insufficient_balance": "terminal",
+}
+
+_TOKEN_RE = re.compile(r"^([a-z][a-z0-9_]{2,63}):")
+
+
+def classify_error_token(token: str | None) -> str:
+    """Classify a bridge/chain machine error token into a caller disposition
+    ('retry' | 'reconcile' | 'terminal' | 'unknown'). Tokens are the stable
+    snake_case prefix of bridge error messages and the ``error_token`` field
+    of chain write results (see skills/06-errors.md)."""
+    return _TOKEN_DISPOSITIONS.get(token or "", "unknown")
+
+
+def _extract_error_token(message: str) -> str | None:
+    """The leading stable machine token of a bridge error message (the bridge
+    leads legible errors with ``<token>: <detail>``)."""
+    m = _TOKEN_RE.match(message)
+    return m.group(1) if m else None
+
+
 class BridgeError(ThreadError):
-    """The bridge returned an error response."""
+    """The bridge returned an error response.
+
+    ``error_token`` is the stable machine token leading the bridge's message
+    (when legible), e.g. 'bid_not_found' / 'accept_bid_chain_race';
+    ``disposition`` classifies it ('retry'/'reconcile'/'terminal'/'unknown').
+    """
 
     def __init__(self, code: int | str, message: str):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.error_token = _extract_error_token(message)
+
+    @property
+    def disposition(self) -> str:
+        return classify_error_token(self.error_token)
 
 
 class ChainWriteError(ThreadError):
@@ -145,6 +197,11 @@ class ChainWriteError(ThreadError):
         self.chain_code = code
         self.log = log
         self.error_token = error_token
+
+    @property
+    def disposition(self) -> str:
+        """What to do with this failure — see ``classify_error_token``."""
+        return classify_error_token(self.error_token)
 
 
 # ---- canonical CBOR helpers -----------------------------------------------
@@ -726,6 +783,7 @@ class ThreadClient:
         bid_id_hex: str,
         seller_id_hex: str,
         agreed_price_micro: int,
+        race_retries: int = 3,
     ) -> dict[str, Any]:
         """Accept a bid (mirrors post_offer/post_bid).
 
@@ -733,7 +791,35 @@ class ThreadClient:
         escrow-open call. The bridge canonicalises the Acceptance document; the
         SDK signs it locally (cose_sign1_hex) and also signs the chain AcceptBid
         transaction locally (chain_inner_sig_hex); the bridge relays both.
+
+        ``race_retries`` bounds the auto-retries when the bridge answers the
+        legible ``accept_bid_chain_race`` token (bid not yet visible on chain —
+        a transient ordering race); 0 disables. Every other failure raises
+        immediately — check ``e.disposition``: ``bid_not_found`` is terminal;
+        ``bid_already_accepted`` means read ``query_escrow_by_bid`` and
+        proceed from current state.
         """
+        attempt = 0
+        while True:
+            try:
+                return self._accept_bid_once(
+                    offer_id_hex, bid_id_hex, seller_id_hex, agreed_price_micro
+                )
+            except (BridgeError, ChainWriteError) as e:
+                if e.disposition != "retry" or attempt >= race_retries:
+                    raise
+                # accept_bid_chain_race: "retry in a few seconds" per the
+                # bridge hint — linear backoff keeps total wait bounded.
+                attempt += 1
+                time.sleep(2.0 * attempt)
+
+    def _accept_bid_once(
+        self,
+        offer_id_hex: str,
+        bid_id_hex: str,
+        seller_id_hex: str,
+        agreed_price_micro: int,
+    ) -> dict[str, Any]:
         build_params: dict[str, Any] = {
             "bid_id_hex": bid_id_hex,
             "seller_id_hex": seller_id_hex,
@@ -782,6 +868,22 @@ class ThreadClient:
             "thread.query_escrow", {"acceptance_id_hex": acceptance_id_hex}
         )
         return result or {}
+
+    def query_escrow_by_bid(self, bid_id_hex: str) -> dict[str, Any]:
+        """Escrow lookup by bid id, with the PENDING half of the contract typed:
+
+        - ``{"found": True, ...escrow}`` — accepted; escrow fields include
+          acceptance_id_hex, buyer_id_hex, state, seller_paid, …
+        - ``{"found": False, "state": "no_escrow_yet"}`` — the bid EXISTS and
+          awaits acceptance: keep waiting (wait_for_acceptance does this).
+        - ``{"found": False, "state": "bid_not_found"}`` — no such bid on the
+          bridge: TERMINAL for this bid_id — the listing/bid left the market;
+          re-query offers and bid again. Never poll this state.
+        """
+        result, _ = self._invoke(
+            "thread.query_escrow_by_bid", {"bid_id_hex": bid_id_hex}
+        )
+        return result or {"found": False, "state": "no_escrow_yet"}
 
     # -- seller wake (thread.await_owner_events long-poll) ------------------
 
@@ -880,11 +982,16 @@ class ThreadClient:
         while time.monotonic() < deadline:
             # 1) Reconcile first — await covers FUTURE events only.
             try:
-                result, _ = self._invoke(
-                    "thread.query_escrow_by_bid", {"bid_id_hex": bid_id_hex}
-                )
-                if result and result.get("acceptance_id_hex"):
+                result = self.query_escrow_by_bid(bid_id_hex)
+                if result.get("found") and result.get("acceptance_id_hex"):
                     return result
+                if not result.get("found") and result.get("state") == "bid_not_found":
+                    # Terminal per the bridge contract: the bid no longer
+                    # exists (purged/superseded) — polling can never succeed.
+                    raise ThreadError(
+                        f"wait_for_acceptance: bid_not_found — bid {bid_id_hex} "
+                        "left the market; re-run query_offers and bid again"
+                    )
             except BridgeError:
                 pass
             # 2) Block on the wake channel (costs nothing while waiting);
@@ -1115,10 +1222,20 @@ class ThreadClient:
 
         nonce = self._next_chain_nonce()
         filer_id_bytes = _sha256(self.kp.pk_bytes)
-        inner_bytes = encode_mark_disputed(
+        # ChainTx variant 10 is FileDispute (138 B, +reason+evidence_hash)
+        # since the v5 clearinghouse chain — the signature must cover the
+        # exact bytes the bridge re-encodes (reason + evidence hash or zeros).
+        evidence_hash_bytes = (
+            bytes.fromhex(evidence_hash_hex)
+            if evidence_hash_hex and len(evidence_hash_hex) == 64
+            else b"\x00" * 32
+        )
+        inner_bytes = encode_file_dispute(
             chain_escrow_id,
             bytes.fromhex(dispute_id_hex),
             filer_id_bytes,
+            reason,
+            evidence_hash_bytes,
             nonce,
         )
         chain_inner_sig_hex = self._sign_chain(inner_bytes)
@@ -1131,6 +1248,111 @@ class ThreadClient:
         )
         result, _ = self._invoke("thread.file_dispute", submit_params)
         self._check_chain_result("thread.file_dispute", result)
+        return result or {}
+
+    def query_dispute(self, dispute_id_hex: str) -> dict[str, Any]:
+        """Read a dispute record by id (unauthenticated; the dispute lifecycle
+        is part of the economically-public trade record). Returns the bridge's
+        DisputeResult: {exists, status, reason_label, assigned_oracle_hex,
+        resolution, resolved_slot, ...}."""
+        result, _ = self._invoke(
+            "thread.query_dispute", {"dispute_id_hex": dispute_id_hex}
+        )
+        return result or {}
+
+    def file_appeal(
+        self,
+        parent_dispute_id_hex: str,
+        reason: int = 0,
+        evidence_hash_hex: str | None = None,
+    ) -> dict[str, Any]:
+        """Appeal a RESOLVED dispute (§15.5; ChainTx FileAppeal — requires
+        chain app_version >= 8). Either escrow party may appeal within the
+        appeal window. FILING LOCKS AN APPEAL BOND from your balance:
+        max(2× the original evidence bond, 20% of agreed price) — returned if
+        the appeal succeeds or times out, slashed 50/50 iff adjudicated
+        frivolous. Settled principal NEVER claws back — the appeal verdict is
+        declaratory + disposes the bond. One appeal per dispute; no appeal of
+        an appeal.
+
+        Non-custodial: the SDK derives the deterministic appeal id, encodes
+        and signs the chain FileAppeal transaction locally, and submits only
+        the signature (``chain_inner_sig_hex``); your private key never leaves
+        this process. Raises ChainWriteError on a chain reject (window closed /
+        already appealed / bond insufficient — check ``e.error_token``/``e.log``).
+
+        Returns {status, appeal_dispute_id_hex, appeal_bond_micro, ...}.
+        """
+        if len(parent_dispute_id_hex) != 64:
+            raise ThreadError("file_appeal: parent_dispute_id_hex must be 32-byte hex")
+        # Pre-flight: resolve the parent dispute's escrow (chain_escrow_id =
+        # sha256(bid_id)) via the public reads: dispute → delivery → bid.
+        dispute = self.query_dispute(parent_dispute_id_hex)
+        if dispute.get("exists") is not True:
+            raise ThreadError("file_appeal: parent dispute not found")
+        delivery_id_hex = dispute.get("delivery_id_hex")
+        if not delivery_id_hex:
+            raise ThreadError("file_appeal: parent dispute carries no delivery_id")
+        poll_res, _ = self._invoke(
+            "thread.poll_delivery", {"delivery_id_hex": delivery_id_hex}
+        )
+        bid_hex = poll_res.get("bid_id_hex")
+        if not bid_hex and poll_res.get("acceptance_id_hex"):
+            esc = self.query_escrow(poll_res["acceptance_id_hex"])
+            bid_hex = esc.get("bid_id_hex")
+        if not bid_hex or len(bid_hex) != 64:
+            raise ThreadError("file_appeal: cannot resolve bid_id for chain_escrow_id")
+        chain_escrow_id = _sha256(bytes.fromhex(bid_hex))
+
+        # Deterministic appeal id — must match the bridge's derivation
+        # exactly: sha256(b"thread.file_appeal" + parent + appellant + nonce_le).
+        nonce = self._next_chain_nonce()
+        appellant_id = _sha256(self.kp.pk_bytes)
+        parent_dispute_id = bytes.fromhex(parent_dispute_id_hex)
+        nonce_le = nonce.to_bytes(8, "little")
+        appeal_dispute_id = hashlib.sha256(
+            b"thread.file_appeal" + parent_dispute_id + appellant_id + nonce_le
+        ).digest()
+
+        evidence_hash = (
+            bytes.fromhex(evidence_hash_hex)
+            if evidence_hash_hex and len(evidence_hash_hex) == 64
+            else b"\x00" * 32
+        )
+        inner_bytes = encode_file_appeal(
+            appellant_id,
+            chain_escrow_id,
+            parent_dispute_id,
+            appeal_dispute_id,
+            reason,
+            evidence_hash,
+            nonce,
+        )
+        chain_inner_sig_hex = self._sign_chain(inner_bytes)
+
+        params: dict[str, Any] = {
+            "parent_dispute_id_hex": parent_dispute_id_hex,
+            "reason": reason,
+            "agent_pubkey_hex": self.kp.pubkey_hex,
+            "chain_inner_sig_hex": chain_inner_sig_hex,
+            "nonce": str(nonce),
+        }
+        if evidence_hash_hex is not None:
+            params["evidence_hash_hex"] = evidence_hash_hex
+        result, _ = self._invoke("thread.file_appeal", params)
+        self._check_chain_result("thread.file_appeal", result)
+        return result or {}
+
+    def query_profile_definition(self, profile_uri: str) -> dict[str, Any]:
+        """Dereference a capability profile uri (the ``capability_profile_id``
+        scout returns, e.g. ``setix://0x0301/v1``) into its machine-readable
+        trading contract: input/output CDDL, resource-unit types, recommended
+        verification types, deprecation state. Unauthenticated read. Returns
+        ``{found: True, profile: {...}}`` or ``{found: False, profile_uri,
+        note}``."""
+        result, _ = self._invoke(
+            "thread.query_profile_definition", {"profile_uri": profile_uri}
+        )
         return result or {}
 
     # -- high-level (HL) methods — v0.1.37 ----------------------------------

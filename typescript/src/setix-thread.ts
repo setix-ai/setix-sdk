@@ -72,7 +72,8 @@ import {
     encodeAcceptBid,
     encodeSubmitDelivery,
     encodeSettle,
-    encodeMarkDisputed,
+    encodeFileDispute,
+    encodeFileAppeal,
     signChainTxLocal,
 } from './chain-tx-encoders.js';
 
@@ -107,9 +108,60 @@ export class ThreadError extends Error {
     override readonly name = 'ThreadError';
 }
 
+/**
+ * What a caller should DO with a failed call, derived from the bridge's
+ * stable machine error token:
+ *  - 'retry'     — transient ordering race; retry the same call after a short
+ *                  backoff (e.g. `accept_bid_chain_race`: the bid is not yet
+ *                  visible on chain).
+ *  - 'reconcile' — the operation may ALREADY have succeeded (e.g.
+ *                  `bid_already_accepted`): do not re-submit; read current
+ *                  state (`queryEscrowByBid`) and proceed from it.
+ *  - 'terminal'  — the precondition is gone (e.g. `bid_not_found`,
+ *                  `chain_offer_not_found`): re-submitting the same call can
+ *                  never succeed; go back one step (re-query, re-bid, fund).
+ *  - 'unknown'   — no token / an unclassified token: treat as terminal
+ *                  unless you know better.
+ */
+export type ErrorDisposition = 'retry' | 'reconcile' | 'terminal' | 'unknown';
+
+/** Classify a bridge/chain machine error token into a caller disposition.
+ *  Tokens are the stable snake_case prefix of bridge error messages and the
+ *  `error_token` field of chain write results (see skills/06-errors.md). */
+export function classifyErrorToken(token: string | null | undefined): ErrorDisposition {
+    switch (token) {
+        case 'accept_bid_chain_race':
+            return 'retry';
+        case 'bid_already_accepted':
+            return 'reconcile';
+        case 'bid_not_found':
+        case 'chain_offer_not_found':
+        case 'chain_offer_fills_exhausted':
+        case 'insufficient_balance':
+            return 'terminal';
+        default:
+            return 'unknown';
+    }
+}
+
+/** Extract the leading stable machine token from a bridge error message
+ *  (the bridge leads legible errors with `<token>: <detail>`). */
+function extractErrorToken(message: string): string | undefined {
+    const m = /^([a-z][a-z0-9_]{2,63}):/.exec(message);
+    return m ? m[1] : undefined;
+}
+
 export class BridgeError extends ThreadError {
+    /** The stable machine token leading the bridge's message (when legible),
+     *  e.g. 'bid_not_found' / 'accept_bid_chain_race'. */
+    readonly errorToken: string | undefined;
     constructor(public readonly code: number | string, message: string) {
         super(`${code}: ${message}`);
+        this.errorToken = extractErrorToken(message);
+    }
+    /** What to do with this failure — see ErrorDisposition. */
+    get disposition(): ErrorDisposition {
+        return classifyErrorToken(this.errorToken);
     }
 }
 
@@ -133,6 +185,10 @@ export class ChainWriteError extends ThreadError {
         public readonly errorToken?: string,
     ) {
         super(`${tool}: chain write failed (code=${chainCode})${errorToken ? ` [${errorToken}]` : ''}: ${log}`);
+    }
+    /** What to do with this failure — see ErrorDisposition. */
+    get disposition(): ErrorDisposition {
+        return classifyErrorToken(this.errorToken);
     }
 }
 
@@ -265,6 +321,18 @@ export interface ThreadClientOptions {
     bridgeUrl: string;
     keyPath?: string;
 }
+
+/** The typed result union of `thread.query_escrow_by_bid` — the found
+ *  escrow, or one of the two legible pending states (see queryEscrowByBid). */
+export type EscrowByBid =
+    | ({ found: true } & Record<string, unknown>)
+    | {
+        found: false;
+        bid_id_hex?: string;
+        /** 'no_escrow_yet' — keep waiting; 'bid_not_found' — terminal. */
+        state: 'no_escrow_yet' | 'bid_not_found';
+        note?: string;
+    };
 
 export class ThreadClient {
     readonly bridgeUrl: string;
@@ -673,6 +741,31 @@ export class ThreadClient {
 
     async acceptBid(args: {
         offerIdHex: string; bidIdHex: string; sellerIdHex: string; agreedPriceMicro: bigint;
+        /** Bounded auto-retries when the bridge answers the legible
+         *  `accept_bid_chain_race` token (bid not yet visible on chain —
+         *  a transient ordering race). Default 3; 0 disables. Every other
+         *  failure surfaces immediately (check `e.disposition`:
+         *  `bid_not_found` is terminal, `bid_already_accepted` means read
+         *  `queryEscrowByBid` and proceed). */
+        raceRetries?: number;
+    }): Promise<{ acceptanceIdHex: string }> {
+        const retries = args.raceRetries ?? 3;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await this.acceptBidOnce(args);
+            } catch (e) {
+                const disposition = (e instanceof BridgeError || e instanceof ChainWriteError)
+                    ? e.disposition : 'unknown';
+                if (disposition !== 'retry' || attempt >= retries) throw e;
+                // accept_bid_chain_race: "retry in a few seconds" per the
+                // bridge hint — linear backoff keeps total wait bounded.
+                await new Promise<void>((r) => setTimeout(r, 2_000 * (attempt + 1)));
+            }
+        }
+    }
+
+    private async acceptBidOnce(args: {
+        offerIdHex: string; bidIdHex: string; sellerIdHex: string; agreedPriceMicro: bigint;
     }): Promise<{ acceptanceIdHex: string }> {
         // Accept a bid (mirrors postOffer/postBid). Escrow opens on the chain
         // as part of accept_bid — there is no separate escrow-open call. The
@@ -731,6 +824,21 @@ export class ThreadClient {
         } catch {
             return {};
         }
+    }
+
+    /**
+     * Escrow lookup by bid id, with the PENDING half of the contract typed:
+     *  - `{ found: true, ...escrow }` — accepted; escrow fields include
+     *    acceptance_id_hex, buyer_id_hex, state, seller_paid, …
+     *  - `{ found: false, state: 'no_escrow_yet' }` — the bid EXISTS and
+     *    awaits acceptance: keep waiting (waitForAcceptance does this).
+     *  - `{ found: false, state: 'bid_not_found' }` — no such bid on the
+     *    bridge: TERMINAL for this bid_id — the listing/bid left the market;
+     *    re-query offers and bid again. Never poll this state.
+     */
+    async queryEscrowByBid(bidIdHex: string): Promise<EscrowByBid> {
+        const { result } = await this.invoke('thread.query_escrow_by_bid', { bid_id_hex: bidIdHex });
+        return (result ?? { found: false, state: 'no_escrow_yet' }) as EscrowByBid;
     }
 
     // -- seller wake (thread.await_owner_events long-poll) ------------------
@@ -821,10 +929,22 @@ export class ThreadClient {
         while (Date.now() < deadline) {
             // 1) Reconcile first — await covers FUTURE events only.
             try {
-                const { result } = await this.invoke('thread.query_escrow_by_bid', { bid_id_hex: bidIdHex });
-                const r = result as { acceptance_id_hex?: string };
-                if (r && r.acceptance_id_hex) return result as Record<string, unknown>;
-            } catch { /* reconcile again next cycle */ }
+                const esc = await this.queryEscrowByBid(bidIdHex);
+                if (esc.found && (esc as Record<string, unknown>)['acceptance_id_hex']) {
+                    return esc as Record<string, unknown>;
+                }
+                if (!esc.found && esc.state === 'bid_not_found') {
+                    // Terminal per the bridge contract: the bid no longer
+                    // exists (purged/superseded) — polling can never succeed.
+                    throw new ThreadError(
+                        `waitForAcceptance: bid_not_found — bid ${bidIdHex} left the market; ` +
+                        're-run queryOffers and bid again',
+                    );
+                }
+            } catch (e) {
+                if (e instanceof ThreadError && !(e instanceof BridgeError)) throw e;
+                /* transient read failure — reconcile again next cycle */
+            }
             // 2) Block on the wake channel (costs nothing while waiting);
             //    fall back to sleep-polling if the wake path is unavailable.
             if (wakeAvailable) {
@@ -1052,7 +1172,15 @@ export class ThreadClient {
         const nonce = await this.getNextChainNonce();
         const filerIdBytes = sha256(this.kp.publicKey);
         const disputeIdBytes = new Uint8Array(Buffer.from(disputeIdHex, 'hex'));
-        const innerBytes = encodeMarkDisputed(chainEscrowId, disputeIdBytes, filerIdBytes, nonce);
+        // ChainTx variant 10 is FileDispute (138 B, +reason+evidence_hash)
+        // since the v5 clearinghouse chain — the signature must cover the
+        // exact bytes the bridge re-encodes (reason + evidence hash or zeros).
+        const evidenceHashBytes = typeof args.evidenceHashHex === 'string' && /^[0-9a-fA-F]{64}$/.test(args.evidenceHashHex)
+            ? new Uint8Array(Buffer.from(args.evidenceHashHex, 'hex'))
+            : new Uint8Array(32);
+        const innerBytes = encodeFileDispute(
+            chainEscrowId, disputeIdBytes, filerIdBytes, args.reason ?? 0, evidenceHashBytes, nonce,
+        );
         const chainInnerSigHex = Buffer.from(signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId())).toString('hex');
 
         const submitParams = this.packPassthroughParams({
@@ -1069,6 +1197,114 @@ export class ThreadClient {
             status: r.status,
             assignedOracleHex: r.assigned_oracle_hex ?? null,
         };
+    }
+
+    /** Read a dispute record by id (unauthenticated; the dispute lifecycle is
+     *  part of the economically-public trade record). Returns the bridge's
+     *  DisputeResult: {exists, status, reason_label, assigned_oracle_hex,
+     *  resolution, resolved_slot, ...}. */
+    async queryDispute(disputeIdHex: string): Promise<Record<string, unknown>> {
+        const { result } = await this.invoke('thread.query_dispute', { dispute_id_hex: disputeIdHex });
+        return (result ?? {}) as Record<string, unknown>;
+    }
+
+    /**
+     * Appeal a RESOLVED dispute (§15.5; ChainTx FileAppeal — requires chain
+     * app_version >= 8). Either escrow party may appeal within the appeal
+     * window. FILING LOCKS AN APPEAL BOND from your balance:
+     * max(2× the original evidence bond, 20% of agreed price) — returned if
+     * the appeal succeeds or times out, slashed 50/50 iff adjudicated
+     * frivolous. Settled principal NEVER claws back — the appeal verdict is
+     * declaratory + disposes the bond. One appeal per dispute; no appeal of
+     * an appeal.
+     *
+     * Non-custodial: the SDK derives the deterministic appeal id, encodes and
+     * signs the chain FileAppeal transaction locally, and submits only the
+     * signature (`chain_inner_sig_hex`); your private key never leaves this
+     * process. Throws ChainWriteError on a chain reject (window closed /
+     * already appealed / bond insufficient — check `e.errorToken`/`e.log`).
+     */
+    async fileAppeal(args: {
+        parentDisputeIdHex: string;
+        /** §13.6 reason code for the appeal (0 not_delivered … 7). Default 0. */
+        reason?: number;
+        /** Optional sha256 (hex) of new appeal evidence. */
+        evidenceHashHex?: string;
+    }): Promise<{ status: string; appealDisputeIdHex: string; appealBondMicro: string | null }> {
+        if (!/^[0-9a-fA-F]{64}$/.test(args.parentDisputeIdHex)) {
+            throw new ThreadError('fileAppeal: parentDisputeIdHex must be 32-byte hex');
+        }
+        // Pre-flight: resolve the parent dispute's escrow (chain_escrow_id =
+        // sha256(bid_id)) via the public reads: dispute → delivery → bid.
+        const dispute = await this.queryDispute(args.parentDisputeIdHex);
+        if (dispute['exists'] !== true) throw new ThreadError('fileAppeal: parent dispute not found');
+        const deliveryIdHex = dispute['delivery_id_hex'] as string | null;
+        if (!deliveryIdHex) throw new ThreadError('fileAppeal: parent dispute carries no delivery_id');
+        const { result: poll } = await this.invoke('thread.poll_delivery', { delivery_id_hex: deliveryIdHex });
+        const p = poll as { bid_id_hex?: string; acceptance_id_hex?: string };
+        let bidIdHex = p.bid_id_hex;
+        if (!bidIdHex && p.acceptance_id_hex) {
+            const esc = await this.queryEscrow(p.acceptance_id_hex);
+            bidIdHex = esc['bid_id_hex'] as string | undefined;
+        }
+        if (!bidIdHex || bidIdHex.length !== 64) {
+            throw new ThreadError('fileAppeal: cannot resolve bid_id for chain_escrow_id');
+        }
+        const chainEscrowId = sha256(new Uint8Array(Buffer.from(bidIdHex, 'hex')));
+
+        // Deterministic appeal id — must match the bridge's derivation
+        // exactly: sha256('thread.file_appeal' ‖ parent ‖ appellant ‖ nonce_le).
+        const nonce = await this.getNextChainNonce();
+        const appellantId = sha256(this.kp.publicKey);
+        const parentDisputeId = new Uint8Array(Buffer.from(args.parentDisputeIdHex, 'hex'));
+        const nonceLe = Buffer.alloc(8);
+        nonceLe.writeBigUInt64LE(nonce);
+        const appealDisputeId = new Uint8Array(createHash('sha256')
+            .update('thread.file_appeal')
+            .update(parentDisputeId)
+            .update(appellantId)
+            .update(nonceLe)
+            .digest());
+
+        const reason = args.reason ?? 0;
+        const evidenceHash = args.evidenceHashHex && /^[0-9a-fA-F]{64}$/.test(args.evidenceHashHex)
+            ? new Uint8Array(Buffer.from(args.evidenceHashHex, 'hex'))
+            : new Uint8Array(32);
+        const innerBytes = encodeFileAppeal(
+            appellantId, chainEscrowId, parentDisputeId, appealDisputeId, reason, evidenceHash, nonce,
+        );
+        const chainInnerSigHex = Buffer.from(
+            signChainTxLocal(innerBytes, this.kp.privateKey, await this.getNativeChainId()),
+        ).toString('hex');
+
+        const params: Record<string, unknown> = {
+            parent_dispute_id_hex: args.parentDisputeIdHex,
+            reason,
+            agent_pubkey_hex: this.kp.pubkeyHex,
+            chain_inner_sig_hex: chainInnerSigHex,
+            nonce: nonce.toString(),
+        };
+        if (args.evidenceHashHex !== undefined) params['evidence_hash_hex'] = args.evidenceHashHex;
+        const { result } = await this.invoke('thread.file_appeal', params);
+        this.checkChainResult('thread.file_appeal', result);
+        const r = result as { status: string; appeal_dispute_id_hex?: string; appeal_bond_micro?: string };
+        return {
+            status: r.status,
+            appealDisputeIdHex: r.appeal_dispute_id_hex ?? Buffer.from(appealDisputeId).toString('hex'),
+            appealBondMicro: r.appeal_bond_micro ?? null,
+        };
+    }
+
+    /**
+     * Dereference a capability profile uri (the `capability_profile_id` scout
+     * returns, e.g. `setix://0x0301/v1`) into its machine-readable trading
+     * contract: input/output CDDL, resource-unit types, recommended
+     * verification types, deprecation state. Unauthenticated read. Returns
+     * `{found: true, profile: {...}}` or `{found: false, profile_uri, note}`.
+     */
+    async queryProfileDefinition(profileUri: string): Promise<Record<string, unknown>> {
+        const { result } = await this.invoke('thread.query_profile_definition', { profile_uri: profileUri });
+        return (result ?? {}) as Record<string, unknown>;
     }
 
     // -- high-level (HL) methods — v0.1.37 ----------------------------------

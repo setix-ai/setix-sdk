@@ -11,7 +11,7 @@ Transaction layout (u8 discriminant, then fields; all integers little-endian).
 µCOSR PRICE/amount fields are u128 (16 B), not u64 — the chain's transaction
 encoder is the source of truth; these MUST match byte-for-byte or the chain
 rejects the signature.
-  1  CapitalExit:     agent(32) | micro_cosr(u64) | nonce(u64)                  = 49 B
+  1  CapitalExit:     agent(32) | micro_cosr(u128) | nonce(u64)                 = 57 B
   3  UpdateManifest:  agent(32) | len(u32) | manifest | nonce(u64)             = variable
   5  PostOffer:       poster(32) | offer(32) | category(u32) | slots(u32)
                          | max_price(u128) | nonce(u64)                         = 97 B
@@ -20,11 +20,16 @@ rejects the signature.
   7  AcceptBid:       buyer(32) | bid(32) | escrow(32) | price(u128) | nonce    = 121 B
   8  SubmitDelivery:  seller(32) | escrow(32) | output_hash(32) | nonce(u64)    = 105 B
   9  Settle:          caller(32) | escrow(32) | nonce(u64)                      = 73 B
- 10  MarkDisputed:    escrow(32) | dispute(32) | filer(32) | nonce(u64)         = 105 B
+ 10  FileDispute:     escrow(32) | dispute(32) | filer(32) | reason(u8)
+                         | evidence_hash(32) | nonce(u64)                       = 138 B
+                         (was MarkDisputed before the v5 chain)
  11  PartialRelease:  caller(32) | escrow(32) | released_micro(u128)
                          | refunded_micro(u128) | nonce(u64)                    = 105 B
  12  Refund:          filer(32) | escrow(32) | nonce(u64)                       = 73 B
  13  Expire:          caller(32) | escrow(32) | nonce(u64)                      = 73 B
+ 28  FileAppeal:      appellant(32) | escrow(32) | parent_dispute(32)
+                         | appeal_dispute(32) | reason(u8) | evidence_hash(32)
+                         | nonce(u64)  (§15.5 appeals; chain app_version >= 8) = 170 B
 
 Signatures use chain-id domain separation (see ``signing_payload``): the
 pre-image is ``sha256("setix-tx-v2" + chain_id) + inner``. This binds every
@@ -33,12 +38,13 @@ replayed on another. Read ``chain_id`` once from the bridge's
 ``platform_health.native_chain_id``.
 
 STALENESS NOTE (deliberate scope, v8 dispute turn 2026-07-06): this module
-covers variants <= 13 only. Later variants (17 PokeAutoRelease, 24 PostOfferV2,
-25 PokeDisputeTimeout, 26-28 dispute hard mechanics: SetDisputeOracle /
-ResolveDisputeByOracle / FileAppeal) are NOT encoded here — the TypeScript
-encoders (the live bridge path) are the maintained set; use the corresponding
-MCP tools (e.g. ``thread.file_appeal``) instead of raw chain encoding. A Python
-encoder for a newer variant lands only with a matching Rust golden vector.
+covers variants <= 13 plus 28 (FileAppeal, landed with the Rust golden vector
+``file_appeal_borsh_golden_vector``). Other later variants (17 PokeAutoRelease,
+24 PostOfferV2, 25 PokeDisputeTimeout, 26-27 SetDisputeOracle /
+ResolveDisputeByOracle — both operator/oracle-side) are NOT encoded here — the
+TypeScript encoders (the live bridge path) are the maintained set; use the
+corresponding MCP tools instead of raw chain encoding. A Python encoder for a
+newer variant lands only with a matching Rust golden vector.
 """
 
 from __future__ import annotations
@@ -83,8 +89,15 @@ def _u128_le(v: int) -> bytes:
 
 
 def encode_capital_exit(agent: bytes, micro_cosr: int, nonce: int) -> bytes:
-    """Variant 1 — agent(32) | micro_cosr(u64 LE) | nonce(u64 LE)."""
-    return b"\x01" + _require_32("agent", agent) + struct.pack("<QQ", micro_cosr, nonce)
+    """Variant 1 — agent(32) | micro_cosr(u128 LE) | nonce(u64 LE) = 57 B.
+
+    §8a u128 micro_cosr (chain truth since the v5 clearinghouse chain)."""
+    return (
+        b"\x01"
+        + _require_32("agent", agent)
+        + _u128_le(micro_cosr)
+        + struct.pack("<Q", nonce)
+    )
 
 
 def encode_update_manifest(agent_id: bytes, manifest_bytes: bytes, nonce: int) -> bytes:
@@ -183,20 +196,44 @@ def encode_settle(caller_id: bytes, escrow_id: bytes, nonce: int) -> bytes:
     )
 
 
+def encode_file_dispute(
+    escrow_id: bytes,
+    dispute_id: bytes,
+    filer_id: bytes,
+    reason_code: int,
+    evidence_hash: bytes,
+    nonce: int,
+) -> bytes:
+    """Variant 10 — FileDispute (was MarkDisputed before the v5 chain):
+    escrow(32) | dispute(32) | filer(32) | reason(u8) | evidence_hash(32)
+    | nonce(u64) = 138 B.
+
+    ``reason_code`` is the §13.6 dispute reason; ``evidence_hash`` anchors the
+    §13.6 dispute content into the on-chain DisputeRecord (32 zero bytes =
+    none)."""
+    return (
+        b"\x0a"
+        + _require_32("escrow_id", escrow_id)
+        + _require_32("dispute_id", dispute_id)
+        + _require_32("filer_id", filer_id)
+        + struct.pack("<B", reason_code & 0xFF)
+        + _require_32("evidence_hash", evidence_hash)
+        + struct.pack("<Q", nonce)
+    )
+
+
 def encode_mark_disputed(
     escrow_id: bytes,
     dispute_id: bytes,
     filer_id: bytes,
     nonce: int,
 ) -> bytes:
-    """Variant 10 — escrow(32) | dispute(32) | filer(32) | nonce(u64) = 105 B."""
-    return (
-        b"\x0a"
-        + _require_32("escrow_id", escrow_id)
-        + _require_32("dispute_id", dispute_id)
-        + _require_32("filer_id", filer_id)
-        + struct.pack("<Q", nonce)
-    )
+    """DEPRECATED — the chain's variant 10 is FileDispute since the v5
+    clearinghouse chain; the old 105-byte MarkDisputed layout
+    decode-rejects. This wrapper emits the CURRENT layout with reason_code 0
+    and no evidence hash; call ``encode_file_dispute`` directly to anchor a
+    real reason + evidence."""
+    return encode_file_dispute(escrow_id, dispute_id, filer_id, 0, b"\x00" * 32, nonce)
 
 
 def encode_partial_release(
@@ -242,6 +279,36 @@ def encode_expire(
         b"\x0d"
         + _require_32("caller_id", caller_id)
         + _require_32("escrow_id", escrow_id)
+        + struct.pack("<Q", nonce)
+    )
+
+
+def encode_file_appeal(
+    appellant_id: bytes,
+    escrow_id: bytes,
+    parent_dispute_id: bytes,
+    appeal_dispute_id: bytes,
+    reason_code: int,
+    evidence_hash: bytes,
+    nonce: int,
+) -> bytes:
+    """Variant 28 — FileAppeal (§15.5, chain app_version >= 8):
+    appellant(32) | escrow(32) | parent_dispute(32) | appeal_dispute(32)
+    | reason(u8) | evidence_hash(32) | nonce(u64) = 170 B.
+
+    Appeal a RESOLVED dispute as an escrow party. The chain enforces every
+    gate (parent resolved, appeal window, single appeal, party-only) and
+    locks the appeal bond from the appellant's balance at filing. Pinned to
+    the Rust golden vector ``file_appeal_borsh_golden_vector``.
+    """
+    return (
+        b"\x1c"
+        + _require_32("appellant_id", appellant_id)
+        + _require_32("escrow_id", escrow_id)
+        + _require_32("parent_dispute_id", parent_dispute_id)
+        + _require_32("appeal_dispute_id", appeal_dispute_id)
+        + struct.pack("<B", reason_code & 0xFF)
+        + _require_32("evidence_hash", evidence_hash)
         + struct.pack("<Q", nonce)
     )
 

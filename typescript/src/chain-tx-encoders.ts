@@ -10,19 +10,26 @@
  *
  * Transaction layout (u8 discriminant, then fields; all integers little-endian):
  *
- *   1  CapitalExit:     agent(32) | micro_cosr(u64) | nonce(u64)            = 49 B
+ *   1  CapitalExit:     agent(32) | micro_cosr(u128) | nonce(u64)           = 57 B
  *   3  UpdateManifest:  agent(32) | len(u32) | manifest | nonce(u64)        = variable
- *   5  PostOffer:       seller(32) | offer(32) | category(u32) | slots(u32)
- *                          | min_price(u64) | nonce(u64)                    = 89 B
- *   6  PostBid:         buyer(32) | bid(32) | offer(32) | price(u64) | nonce = 113 B
- *   7  AcceptBid:       seller(32) | bid(32) | escrow(32) | price(u64) | nonce = 113 B
+ *   5  PostOffer:       poster(32) | offer(32) | category(u32) | slots(u32)
+ *                          | max_price(u128) | nonce(u64)                   = 97 B
+ *   6  PostBid:         seller(32) | bid(32) | offer(32) | price(u128)
+ *                          | quoted_latency_ms(u64) | nonce(u64)            = 129 B
+ *   7  AcceptBid:       buyer(32) | bid(32) | escrow(32) | price(u128) | nonce = 121 B
  *   8  SubmitDelivery:  seller(32) | escrow(32) | output_hash(32) | nonce   = 105 B
  *   9  Settle:          caller(32) | escrow(32) | nonce(u64)                = 73 B
- *  10  MarkDisputed:    escrow(32) | dispute(32) | filer(32) | nonce        = 105 B
- *  11  PartialRelease:  caller(32) | escrow(32) | released_micro(u64)
- *                          | refunded_micro(u64) | nonce(u64)               = 89 B
+ *  10  FileDispute:     escrow(32) | dispute(32) | filer(32) | reason(u8)
+ *                          | evidence_hash(32) | nonce(u64)                 = 138 B
+ *                          (was MarkDisputed before the v5 chain)
+ *  11  PartialRelease:  caller(32) | escrow(32) | released_micro(u128)
+ *                          | refunded_micro(u128) | nonce(u64)              = 105 B
  *  12  Refund:          filer(32) | escrow(32) | nonce(u64)                 = 73 B
  *  13  Expire:          caller(32) | escrow(32) | nonce(u64)                = 73 B
+ *  28  FileAppeal:      appellant(32) | escrow(32) | parent_dispute(32)
+ *                          | appeal_dispute(32) | reason(u8)
+ *                          | evidence_hash(32) | nonce(u64)                 = 170 B
+ *                          (§15.5 appeals; requires chain app_version >= 8)
  *
  * The encoders are pure functions; no I/O, no allocations beyond the returned
  * `Uint8Array`, no `process.env` dependencies. The test suite at
@@ -99,12 +106,14 @@ export function encodeCapitalExit(
     microCosr: bigint,
     nonce: bigint,
 ): Uint8Array {
-    const buf = new Uint8Array(49);
+    // §8a u128 micro_cosr (chain truth since the v5 clearinghouse chain):
+    // agent(32) ‖ micro_cosr(u128 LE) ‖ nonce(u64 LE) = 57 B.
+    const buf = new Uint8Array(57);
     const view = new DataView(buf.buffer);
     buf[0] = 1;
     copyBytes(buf, agent, 1, 32);
-    writeU64LE(view, 33, microCosr);
-    writeU64LE(view, 41, nonce);
+    writeU128LE(view, 33, microCosr);
+    writeU64LE(view, 49, nonce);
     return buf;
 }
 
@@ -223,22 +232,43 @@ export function encodeSettle(
     return buf;
 }
 
-/** Variant 10 — MarkDisputed:
- *  escrow(32) ‖ dispute(32) ‖ filer(32) ‖ nonce(u64 LE) = 105 B. */
+/** Variant 10 — FileDispute (was MarkDisputed before the v5 chain):
+ *  escrow(32) ‖ dispute(32) ‖ filer(32) ‖ reason_code(u8)
+ *  ‖ evidence_hash(32) ‖ nonce(u64 LE) = 138 B.
+ *  reason_code is the §13.6 dispute reason; evidence_hash anchors the §13.6
+ *  dispute content into the on-chain DisputeRecord ([0;32] = none). */
+export function encodeFileDispute(
+    escrowId: Uint8Array,
+    disputeId: Uint8Array,
+    filerId: Uint8Array,
+    reasonCode: number,
+    evidenceHash: Uint8Array,
+    nonce: bigint,
+): Uint8Array {
+    const buf = new Uint8Array(138);
+    const view = new DataView(buf.buffer);
+    buf[0] = 10;
+    copyBytes(buf, escrowId, 1, 32);
+    copyBytes(buf, disputeId, 33, 32);
+    copyBytes(buf, filerId, 65, 32);
+    buf[97] = reasonCode & 0xff;
+    copyBytes(buf, evidenceHash, 98, 32);
+    writeU64LE(view, 130, nonce);
+    return buf;
+}
+
+/** @deprecated The chain's variant 10 is FileDispute since the v5
+ *  clearinghouse chain — the old 105-byte MarkDisputed
+ *  layout decode-rejects. This wrapper emits the CURRENT layout with
+ *  reason_code 0 and no evidence hash; call `encodeFileDispute` directly to
+ *  anchor a real reason + evidence. */
 export function encodeMarkDisputed(
     escrowId: Uint8Array,
     disputeId: Uint8Array,
     filerId: Uint8Array,
     nonce: bigint,
 ): Uint8Array {
-    const buf = new Uint8Array(105);
-    const view = new DataView(buf.buffer);
-    buf[0] = 10;
-    copyBytes(buf, escrowId, 1, 32);
-    copyBytes(buf, disputeId, 33, 32);
-    copyBytes(buf, filerId, 65, 32);
-    writeU64LE(view, 97, nonce);
-    return buf;
+    return encodeFileDispute(escrowId, disputeId, filerId, 0, new Uint8Array(32), nonce);
 }
 
 /** Variant 11 — PartialRelease:
@@ -291,6 +321,34 @@ export function encodeExpire(
     copyBytes(buf, callerId, 1, 32);
     copyBytes(buf, escrowId, 33, 32);
     writeU64LE(view, 65, nonce);
+    return buf;
+}
+
+/** Variant 28 — FileAppeal (§15.5, chain app_version >= 8):
+ *  appellant(32) ‖ escrow(32) ‖ parent_dispute(32) ‖ appeal_dispute(32)
+ *  ‖ reason_code(u8) ‖ evidence_hash(32) ‖ nonce(u64 LE) = 170 B.
+ *  Appeal a RESOLVED dispute as an escrow party. The chain enforces every
+ *  gate (parent resolved, appeal window, single appeal, party-only) and
+ *  locks the appeal bond from the appellant's balance at filing. */
+export function encodeFileAppeal(
+    appellantId: Uint8Array,
+    escrowId: Uint8Array,
+    parentDisputeId: Uint8Array,
+    appealDisputeId: Uint8Array,
+    reasonCode: number,
+    evidenceHash: Uint8Array,
+    nonce: bigint,
+): Uint8Array {
+    const buf = new Uint8Array(170);
+    const view = new DataView(buf.buffer);
+    buf[0] = 28;
+    copyBytes(buf, appellantId, 1, 32);
+    copyBytes(buf, escrowId, 33, 32);
+    copyBytes(buf, parentDisputeId, 65, 32);
+    copyBytes(buf, appealDisputeId, 97, 32);
+    buf[129] = reasonCode & 0xff;
+    copyBytes(buf, evidenceHash, 130, 32);
+    writeU64LE(view, 162, nonce);
     return buf;
 }
 
