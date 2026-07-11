@@ -394,10 +394,44 @@ export class ThreadClient {
                 | { code?: number; log?: string; error_token?: string }
                 | undefined;
             if (cr && typeof cr === 'object' && (cr.code ?? 0) !== 0) {
+                // Chain code 7 = nonce mismatch: the local allocator drifted
+                // from the chain (another client/process consumed nonces, or
+                // an earlier write never landed). The chain's log carries the
+                // value it expects — 'nonce mismatch: expected N …' — so
+                // re-seed the allocator directly from it (no extra
+                // get_next_nonce fetch; that tool is IP rate-capped), else
+                // invalidate so the next allocation re-fetches.
+                const log = cr.log ?? '';
+                if (cr.code === 7 || log.includes('nonce mismatch')) {
+                    const m = /nonce mismatch:\s*expected\s+(\d+)/.exec(log);
+                    this._nextNonce = m ? BigInt(m[1]!) : null;
+                }
                 throw new ChainWriteError(tool, cr.code ?? -1, cr.log ?? 'unknown', cr.error_token);
             }
         }
         return result;
+    }
+
+    /** True when e is the chain's code-7 nonce-mismatch reject. */
+    private static isNonceMismatch(e: unknown): boolean {
+        return e instanceof ChainWriteError
+            && (e.chainCode === 7 || e.log.includes('nonce mismatch'));
+    }
+
+    /**
+     * Run a chain-write flow, retrying ONCE on the chain's code-7 nonce
+     * mismatch. By the time the retry runs, checkChainResult has re-seeded
+     * the local nonce allocator from the chain's expected value, and the
+     * re-run's fresh thread.build_doc issues a new doc_id (replay-safe).
+     * Every other failure surfaces unchanged.
+     */
+    private async retryOnNonceMismatch<T>(fn: () => Promise<T>): Promise<T> {
+        try {
+            return await fn();
+        } catch (e) {
+            if (!ThreadClient.isNonceMismatch(e)) throw e;
+            return fn();
+        }
     }
 
     /**
@@ -456,21 +490,41 @@ export class ThreadClient {
         };
     }
 
+    /** Local chain-nonce allocator: the next nonce to hand out, or null
+     *  when unseeded / invalidated (the next allocation re-fetches). */
+    private _nextNonce: bigint | null = null;
+    /** Promise-chain mutex serialising nonce allocations. */
+    private _nonceLock: Promise<unknown> = Promise.resolve();
+
     /**
-     * Fetch this agent's next chain nonce via the public
-     * `thread.get_next_nonce` tool, so locally-encoded chain transactions
-     * carry the nonce the chain expects.
+     * Allocate this agent's next chain nonce. Seeds ONCE from the public
+     * `thread.get_next_nonce` tool (IP rate-capped at 2/s — one fetch per
+     * client lifetime, not per write), then returns-and-increments locally
+     * under a promise-chain mutex: N parallel writes get N strictly
+     * consecutive nonces from that single fetch instead of N copies of the
+     * same nonce (the chain rejects all but one with code 7). A chain
+     * nonce-mismatch reject re-seeds the counter — see checkChainResult.
      */
     private async getNextChainNonce(): Promise<bigint> {
-        if (!this.agentIdHex) {
-            // Derive from pubkey if not loaded from meta.
-            this.agentIdHex = Buffer.from(sha256(this.kp.publicKey)).toString('hex');
-        }
-        const { result } = await this.invoke('thread.get_next_nonce', {
-            agent_id_hex: this.agentIdHex,
+        const allocation = this._nonceLock.then(async () => {
+            if (this._nextNonce === null) {
+                if (!this.agentIdHex) {
+                    // Derive from pubkey if not loaded from meta.
+                    this.agentIdHex = Buffer.from(sha256(this.kp.publicKey)).toString('hex');
+                }
+                const { result } = await this.invoke('thread.get_next_nonce', {
+                    agent_id_hex: this.agentIdHex,
+                });
+                const r = result as { next_nonce: string };
+                this._nextNonce = BigInt(r.next_nonce);
+            }
+            const nonce = this._nextNonce;
+            this._nextNonce = nonce + 1n;
+            return nonce;
         });
-        const r = result as { next_nonce: string };
-        return BigInt(r.next_nonce);
+        // Keep the mutex chain usable after a failed seed fetch.
+        this._nonceLock = allocation.catch(() => undefined);
+        return allocation;
     }
 
     /**
@@ -630,6 +684,14 @@ export class ThreadClient {
         maxPriceMicro: bigint;
         setixCode?: number;
     }): Promise<{ offerIdHex: string }> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.postOfferOnce(args));
+    }
+
+    private async postOfferOnce(args: {
+        maxPriceMicro: bigint;
+        setixCode?: number;
+    }): Promise<{ offerIdHex: string }> {
         const sc = args.setixCode ?? this.setixCode;
         if (sc === null) throw new ThreadError('Call register() first or pass setixCode');
         const buildParams: Record<string, unknown> = {
@@ -685,6 +747,16 @@ export class ThreadClient {
         /** Canonical bid-price field (v0.2.75+). Must equal the parent offer's max_price_micro exactly. */
         priceMicro?: bigint;
         /** @deprecated Pass `priceMicro` instead. */
+        quotedPriceMicro?: bigint;
+        quotedLatencyMs?: number;
+    }): Promise<{ bidIdHex: string }> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.postBidOnce(args));
+    }
+
+    private async postBidOnce(args: {
+        offerIdHex: string;
+        priceMicro?: bigint;
         quotedPriceMicro?: bigint;
         quotedLatencyMs?: number;
     }): Promise<{ bidIdHex: string }> {
@@ -752,7 +824,9 @@ export class ThreadClient {
         const retries = args.raceRetries ?? 3;
         for (let attempt = 0; ; attempt++) {
             try {
-                return await this.acceptBidOnce(args);
+                // Retry ONCE on the chain's code-7 nonce mismatch (orthogonal
+                // to the accept_bid_chain_race loop — see retryOnNonceMismatch).
+                return await this.retryOnNonceMismatch(() => this.acceptBidOnce(args));
             } catch (e) {
                 const disposition = (e instanceof BridgeError || e instanceof ChainWriteError)
                     ? e.disposition : 'unknown';
@@ -975,6 +1049,14 @@ export class ThreadClient {
         // opaquely; it never sees plaintext. Omit all three for a normal delivery.
         outputUri?: string; outputHashHex?: string; outputKeyWrapHex?: string;
     }): Promise<{ deliveryIdHex: string; outputHashHex: string }> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.submitDeliveryOnce(args));
+    }
+
+    private async submitDeliveryOnce(args: {
+        acceptanceIdHex: string; buyerIdHex: string; output: string;
+        outputUri?: string; outputHashHex?: string; outputKeyWrapHex?: string;
+    }): Promise<{ deliveryIdHex: string; outputHashHex: string }> {
         // The bridge `thread.build_doc` canonicalises the Delivery document;
         // the SDK signs the canonical bytes locally and also encodes + signs
         // the chain SubmitDelivery transaction locally.
@@ -1125,6 +1207,17 @@ export class ThreadClient {
         evidenceHashHex?: string;
         evidenceBondMicro?: bigint;
     }): Promise<{ disputeIdHex: string; status: string; assignedOracleHex: string | null }> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.fileDisputeOnce(args));
+    }
+
+    private async fileDisputeOnce(args: {
+        deliveryIdHex: string;
+        reason?: number;
+        evidenceUri: string;
+        evidenceHashHex?: string;
+        evidenceBondMicro?: bigint;
+    }): Promise<{ disputeIdHex: string; status: string; assignedOracleHex: string | null }> {
         // The bridge `thread.build_doc` canonicalises the Dispute document;
         // the SDK signs it locally and also encodes + signs the chain
         // MarkDisputed transaction locally. Pre-flight resolves the bid_id
@@ -1229,6 +1322,15 @@ export class ThreadClient {
         /** §13.6 reason code for the appeal (0 not_delivered … 7). Default 0. */
         reason?: number;
         /** Optional sha256 (hex) of new appeal evidence. */
+        evidenceHashHex?: string;
+    }): Promise<{ status: string; appealDisputeIdHex: string; appealBondMicro: string | null }> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.fileAppealOnce(args));
+    }
+
+    private async fileAppealOnce(args: {
+        parentDisputeIdHex: string;
+        reason?: number;
         evidenceHashHex?: string;
     }): Promise<{ status: string; appealDisputeIdHex: string; appealBondMicro: string | null }> {
         if (!/^[0-9a-fA-F]{64}$/.test(args.parentDisputeIdHex)) {
@@ -1393,6 +1495,14 @@ export class ThreadClient {
      * signs the chain Settle transaction locally.
      */
     async settleHl(opts: {
+        deliveryIdHex?: string;
+        acceptanceIdHex?: string;
+    }): Promise<Record<string, unknown>> {
+        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        return this.retryOnNonceMismatch(() => this.settleHlOnce(opts));
+    }
+
+    private async settleHlOnce(opts: {
         deliveryIdHex?: string;
         acceptanceIdHex?: string;
     }): Promise<Record<string, unknown>> {
@@ -1565,27 +1675,39 @@ export class ThreadClient {
 
     /** Sub-seller: deliver output for a workflow node. Set isFinal=true on the last frame;
      *  bridge emits Stream Commit and triggers sub-settlement.
-     *  Returns {frame_id_hex, status, sequence, accumulator_root_hex}. */
+     *  Returns {frame_id_hex, status, sequence, accumulator_root_hex} plus
+     *  deliveryIdHex — the bridge's stored delivery id for the step (the id
+     *  disputeWorkflowStep matches on). */
     async submitWorkflowStepDelivery(args: {
         acceptanceIdHex: string;
         output: string;
         isFinal: boolean;
+        /** Workflow node index (0-based). Defaults to 0 — REQUIRED for every
+         *  non-first node of a multi-node DAG (settle needs all steps committed). */
+        stepIndex?: number;
         resourceUnits?: number;
         resourceUnitType?: number;
-    }): Promise<{ frameIdHex: string; status: string; sequence: number; accumulatorRootHex: string }> {
+    }): Promise<{ frameIdHex: string; status: string; sequence: number; accumulatorRootHex: string; deliveryIdHex?: string }> {
         const buildParams: Record<string, unknown> = {
             acceptance_id_hex: args.acceptanceIdHex,
             output: args.output,
             is_final: args.isFinal,
         };
+        if (args.stepIndex !== undefined) buildParams['step_index'] = args.stepIndex;
         if (args.resourceUnits !== undefined) buildParams['resource_units'] = args.resourceUnits;
         if (args.resourceUnitType !== undefined) buildParams['resource_unit_type'] = args.resourceUnitType;
         const signed = await this.buildAndSign('thread.submit_workflow_step_delivery', buildParams);
         const submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         const { result } = await this.invoke('thread.submit_workflow_step_delivery', submitParams);
         this.checkChainResult('thread.submit_workflow_step_delivery', result);
-        const r = result as { frame_id_hex: string; status: string; sequence: number; accumulator_root_hex: string };
-        return { frameIdHex: r.frame_id_hex, status: r.status, sequence: r.sequence, accumulatorRootHex: r.accumulator_root_hex };
+        const r = result as { frame_id_hex: string; status: string; sequence: number; accumulator_root_hex: string; delivery_id_hex?: string };
+        return {
+            frameIdHex: r.frame_id_hex,
+            status: r.status,
+            sequence: r.sequence,
+            accumulatorRootHex: r.accumulator_root_hex,
+            ...(typeof r.delivery_id_hex === 'string' ? { deliveryIdHex: r.delivery_id_hex } : {}),
+        };
     }
 
     /** Buyer/solver: trigger Nested Settlement after all nodes deliver.
@@ -1603,17 +1725,19 @@ export class ThreadClient {
         if (args.intentIdHex !== undefined) buildParams['intent_id_hex'] = args.intentIdHex;
         if (args.workflowIdHex !== undefined) buildParams['workflow_id_hex'] = args.workflowIdHex;
         if (args.predicateResultHex !== undefined) buildParams['predicate_result_hex'] = args.predicateResultHex;
-        // The bridge builds the Nested Settlement document internally; route
-        // through the build_doc path. build_doc does not cover
-        // thread.settle_workflow_manifest yet — fall back to submitting the
-        // public key only when build_doc reports the tool is not dispatchable.
+        // thread.build_doc covers settle_workflow_manifest (workflow-kind gap
+        // closed 2026-07-10); it pre-resolves the manifest from intent_id /
+        // workflow_id bridge-side. Fall back to submitting the public key only
+        // when the build path cannot produce the doc (legacy not-dispatchable
+        // bridge, or the build-side manifest pre-resolution failed) — the
+        // direct tool call re-runs the resolution and owns the error attribution.
         let submitParams: Record<string, unknown>;
         try {
             const signed = await this.buildAndSign('thread.settle_workflow_manifest', buildParams);
             submitParams = this.packPassthroughParams({ baseParams: buildParams, signed });
         } catch (e) {
             const msg = (e as Error).message ?? '';
-            if (!/not dispatchable/.test(msg)) throw e;
+            if (!/not dispatchable|settle_workflow_manifest/.test(msg)) throw e;
             // Fallback: pass identity only (public key, no secret key).
             submitParams = { ...buildParams, agent_pubkey_hex: this.kp.pubkeyHex };
         }

@@ -1,6 +1,6 @@
 {
   "name": "@setix/thread",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "description": "Setix THREAD SDK \u2014 TypeScript client library",
   "type": "module",
   "main": "./dist/index.js",

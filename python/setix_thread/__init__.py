@@ -40,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -361,6 +362,10 @@ class ThreadClient:
         self.agent_id_hex: str | None = None
         self._native_chain_id: str | None = None
         self._platform_region_id: str | None = None
+        # Local chain-nonce allocator: the next nonce to hand out, or None
+        # when unseeded / invalidated (the next allocation re-fetches).
+        self._next_nonce: int | None = None
+        self._nonce_lock = threading.Lock()
         self._load_meta()
 
     # -- meta cache ---------------------------------------------------------
@@ -407,13 +412,41 @@ class ThreadClient:
         if isinstance(result, dict):
             cr = result.get("chain_result") or result.get("chain_tx_result")
             if isinstance(cr, dict) and cr.get("code", 0) != 0:
-                raise ChainWriteError(
-                    tool,
-                    int(cr.get("code", -1)),
-                    str(cr.get("log", "unknown")),
-                    cr.get("error_token"),
-                )
+                code = int(cr.get("code", -1))
+                log = str(cr.get("log", "unknown"))
+                # Chain code 7 = nonce mismatch: the local allocator drifted
+                # from the chain (another client/process consumed nonces, or
+                # an earlier write never landed). The chain's log carries the
+                # value it expects — 'nonce mismatch: expected N …' — so
+                # re-seed the allocator directly from it (no extra
+                # get_next_nonce fetch; that tool is IP rate-capped), else
+                # invalidate so the next allocation re-fetches.
+                if code == 7 or "nonce mismatch" in log:
+                    m = re.search(r"nonce mismatch:\s*expected\s+(\d+)", log)
+                    with self._nonce_lock:
+                        self._next_nonce = int(m.group(1)) if m else None
+                raise ChainWriteError(tool, code, log, cr.get("error_token"))
         return result
+
+    @staticmethod
+    def _is_nonce_mismatch(e: Exception) -> bool:
+        """True when e is the chain's code-7 nonce-mismatch reject."""
+        return isinstance(e, ChainWriteError) and (
+            e.chain_code == 7 or "nonce mismatch" in e.log
+        )
+
+    def _retry_on_nonce_mismatch(self, fn):
+        """Run a chain-write flow, retrying ONCE on the chain's code-7 nonce
+        mismatch. By the time the retry runs, _check_chain_result has
+        re-seeded the local nonce allocator from the chain's expected value,
+        and the re-run's fresh thread.build_doc issues a new doc_id
+        (replay-safe). Every other failure surfaces unchanged."""
+        try:
+            return fn()
+        except ChainWriteError as e:
+            if not self._is_nonce_mismatch(e):
+                raise
+            return fn()
 
     def _fresh_slot(self) -> int:
         _, slot = self._invoke("thread.platform_health", {})
@@ -512,17 +545,30 @@ class ThreadClient:
         }
 
     def _next_chain_nonce(self) -> int:
-        """Fetch the next valid chain nonce for this agent. Returns 1 when the
-        bridge has no chain RPC configured (dev mode)."""
-        if not self.agent_id_hex:
-            self.agent_id_hex = _sha256(self.kp.pk_bytes).hex()
-        try:
-            result, _ = self._invoke(
-                "thread.get_next_nonce", {"agent_id_hex": self.agent_id_hex}
-            )
-            return int(result.get("next_nonce", "1"))
-        except (BridgeError, ThreadError):
-            return 1
+        """Allocate this agent's next chain nonce. Seeds ONCE from the public
+        `thread.get_next_nonce` tool (IP rate-capped at 2/s — one fetch per
+        client lifetime, not per write), then returns-and-increments locally
+        under a lock: N parallel writes get N strictly consecutive nonces
+        from that single fetch instead of N copies of the same nonce (the
+        chain rejects all but one with code 7). A chain nonce-mismatch reject
+        re-seeds the counter — see _check_chain_result. Raises on a failed
+        seed fetch — a guessed nonce would only burn the write as code 7."""
+        with self._nonce_lock:
+            if self._next_nonce is None:
+                if not self.agent_id_hex:
+                    self.agent_id_hex = _sha256(self.kp.pk_bytes).hex()
+                result, _ = self._invoke(
+                    "thread.get_next_nonce", {"agent_id_hex": self.agent_id_hex}
+                )
+                next_nonce = (result or {}).get("next_nonce")
+                if next_nonce is None:
+                    raise ThreadError(
+                        "get_next_nonce: bridge response missing next_nonce"
+                    )
+                self._next_nonce = int(next_nonce)
+            nonce = self._next_nonce
+            self._next_nonce = nonce + 1
+            return nonce
 
     def _pack_passthrough(
         self,
@@ -653,6 +699,16 @@ class ThreadClient:
         setix_code: int | None = None,
     ) -> dict[str, Any]:
         """Post a buyer offer."""
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._post_offer_once(max_price_micro, setix_code)
+        )
+
+    def _post_offer_once(
+        self,
+        max_price_micro: int,
+        setix_code: int | None = None,
+    ) -> dict[str, Any]:
         sc = setix_code if setix_code is not None else self.setix_code
         if sc is None:
             raise ThreadError("Call register() first or pass setix_code explicitly")
@@ -717,6 +773,24 @@ class ThreadClient:
         sends the canonical `price_micro` field; the bridge accepts either
         name but logs a deprecation note when the alias is used.
         """
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._post_bid_once(
+                offer_id_hex,
+                price_micro,
+                quoted_latency_ms,
+                quoted_price_micro=quoted_price_micro,
+            )
+        )
+
+    def _post_bid_once(
+        self,
+        offer_id_hex: str,
+        price_micro: int | None = None,
+        quoted_latency_ms: int = 5000,
+        *,
+        quoted_price_micro: int | None = None,
+    ) -> dict[str, Any]:
         price = price_micro if price_micro is not None else quoted_price_micro
         if price is None:
             raise ThreadError(
@@ -802,8 +876,12 @@ class ThreadClient:
         attempt = 0
         while True:
             try:
-                return self._accept_bid_once(
-                    offer_id_hex, bid_id_hex, seller_id_hex, agreed_price_micro
+                # Retry ONCE on the chain's code-7 nonce mismatch (orthogonal
+                # to the accept_bid_chain_race loop — see _retry_on_nonce_mismatch).
+                return self._retry_on_nonce_mismatch(
+                    lambda: self._accept_bid_once(
+                        offer_id_hex, bid_id_hex, seller_id_hex, agreed_price_micro
+                    )
                 )
             except (BridgeError, ChainWriteError) as e:
                 if e.disposition != "retry" or attempt >= race_retries:
@@ -1015,6 +1093,14 @@ class ThreadClient:
     def submit_delivery(
         self, acceptance_id_hex: str, buyer_id_hex: str, output: str
     ) -> dict[str, Any]:
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._submit_delivery_once(acceptance_id_hex, buyer_id_hex, output)
+        )
+
+    def _submit_delivery_once(
+        self, acceptance_id_hex: str, buyer_id_hex: str, output: str
+    ) -> dict[str, Any]:
         # Build + sign the Delivery document and the chain SubmitDelivery
         # transaction locally. Pre-flight resolves bid_id
         # (chain_escrow_id = sha256(bid_id)).
@@ -1184,6 +1270,22 @@ class ThreadClient:
         the Dispute document internally.
         Returns {dispute_id_hex, status, assigned_oracle_hex}.
         """
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._file_dispute_once(
+                delivery_id_hex, reason, evidence_uri, evidence_hash_hex,
+                evidence_bond_micro,
+            )
+        )
+
+    def _file_dispute_once(
+        self,
+        delivery_id_hex: str,
+        reason: int = 0,
+        evidence_uri: str = "",
+        evidence_hash_hex: str | None = None,
+        evidence_bond_micro: int = 100_000,
+    ) -> dict[str, Any]:
         build_params: dict[str, Any] = {
             "delivery_id_hex": delivery_id_hex,
             "reason": reason,
@@ -1283,6 +1385,19 @@ class ThreadClient:
 
         Returns {status, appeal_dispute_id_hex, appeal_bond_micro, ...}.
         """
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._file_appeal_once(
+                parent_dispute_id_hex, reason, evidence_hash_hex
+            )
+        )
+
+    def _file_appeal_once(
+        self,
+        parent_dispute_id_hex: str,
+        reason: int = 0,
+        evidence_hash_hex: str | None = None,
+    ) -> dict[str, Any]:
         if len(parent_dispute_id_hex) != 64:
             raise ThreadError("file_appeal: parent_dispute_id_hex must be 32-byte hex")
         # Pre-flight: resolve the parent dispute's escrow (chain_escrow_id =
@@ -1429,6 +1544,16 @@ class ThreadClient:
         output_hash via query_escrow + poll_delivery; the bridge canonicalises
         the Settlement document; the SDK signs it locally and also signs the
         chain Settle transaction locally."""
+        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        return self._retry_on_nonce_mismatch(
+            lambda: self._settle_hl_once(delivery_id_hex, acceptance_id_hex)
+        )
+
+    def _settle_hl_once(
+        self,
+        delivery_id_hex: str | None = None,
+        acceptance_id_hex: str | None = None,
+    ) -> dict[str, Any]:
         if delivery_id_hex is None and acceptance_id_hex is None:
             raise ThreadError("settle_hl: provide delivery_id_hex or acceptance_id_hex")
 
@@ -1656,13 +1781,17 @@ class ThreadClient:
             build_params["workflow_id_hex"] = workflow_id_hex
         if predicate_result_hex is not None:
             build_params["predicate_result_hex"] = predicate_result_hex
-        # build_doc does not cover thread.settle_workflow_manifest yet; fall
-        # back to public-key submission when it is not dispatchable.
+        # thread.build_doc covers settle_workflow_manifest (workflow-kind gap
+        # closed 2026-07-10); it pre-resolves the manifest from intent_id /
+        # workflow_id bridge-side. Fall back to public-key submission when the
+        # build path cannot produce the doc (legacy not-dispatchable bridge, or
+        # the build-side manifest pre-resolution failed) — the direct tool call
+        # re-runs the resolution and owns the error attribution.
         try:
             signed = self._build_and_sign("thread.settle_workflow_manifest", build_params)
             submit_params = self._pack_passthrough(build_params, signed)
         except (BridgeError, ThreadError) as e:
-            if "not dispatchable" not in str(e):
+            if "not dispatchable" not in str(e) and "settle_workflow_manifest" not in str(e):
                 raise
             submit_params = {**build_params, "agent_pubkey_hex": self.kp.pubkey_hex}
         result, _ = self._invoke("thread.settle_workflow_manifest", submit_params)
