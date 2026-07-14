@@ -1,9 +1,9 @@
 {
-  "release": "v0.0.9",
+  "release": "v0.0.10",
   "files": [
-    { "path": "typescript/src/setix-thread.ts", "sha256": "27783e9f1c86afed6174f0d23867a56404a4698b8b9734205bcf1c0ff5d4bbba" },
+    { "path": "typescript/src/setix-thread.ts", "sha256": "a7ea9217ffea7e06e8b61d539071462b2262eeae1e3b4fd00f969d138ab1a35c" },
     { "path": "typescript/src/chain-tx-encoders.ts", "sha256": "554f475ebc34f5856800168f03e140ba9f73455c4dd9c083aa359ec763293fd3" },
-    { "path": "python/setix_thread/__init__.py", "sha256": "0e8e851f5275286ffb2804fae8143be41e2f73764eda4447081e51403c836680" },
+    { "path": "python/setix_thread/__init__.py", "sha256": "475bc00c997be55d6c52337c7b19726f5e87dab13297d1a41f4938b90ea02085" },
     { "path": "python/setix_thread/chain_tx_encoders.py", "sha256": "0bb27f97f46fab3e9522648aeeba141a9d7a55f9838ea09babcc50d739c2a82c" }
   ],
   "generated_at_slot": 0

@@ -85,6 +85,15 @@ from .chain_tx_encoders import (
 
 _SETTLEMENT_FEE_BPS = 100
 
+# §13.2 field 11 / §13.9 — a Bid on a SUBJECTIVE-OUTCOME offer category (TRANSFORMATION,
+# CREATIVE_CONTENT, ADVISORY, EXPERT_JUDGMENT, MARKET_RESEARCH, QUALITATIVE_ANALYSIS —
+# i.e. most real agent work) must DECLARE insurance_stake_micro of at least this many bps
+# of the bid price, or the chain-side gate rejects it (bid_insurance_stake_insufficient).
+# The stake is a declared commitment recorded on the Bid: nothing is locked or debited, so
+# there is no stake deposit to make. post_bid defaults to exactly this floor so a seller
+# that does not know the offer's category still clears the gate.
+INSURANCE_STAKE_MIN_BPS_SUBJECTIVE = 500  # 5%
+
 # Cold-LLM Run 4 finding RUN4.S1: stock urllib's default UA ("Python-urllib/X.Y")
 # is blocked by Cloudflare WAF rule 1010. Send a real UA on every request.
 _SETIX_SDK_USER_AGENT = "setix-thread-sdk/0.1 (python)"
@@ -764,6 +773,7 @@ class ThreadClient:
         quoted_latency_ms: int = 5000,
         *,
         quoted_price_micro: int | None = None,
+        insurance_stake_micro: int | None = None,
     ) -> dict[str, Any]:
         """Post a bid on an open offer.
 
@@ -772,6 +782,20 @@ class ThreadClient:
         for one cycle. If both are supplied, `price_micro` wins. The wire
         sends the canonical `price_micro` field; the bridge accepts either
         name but logs a deprecation note when the alias is used.
+
+        `insurance_stake_micro` (§13.2 field 11) is the insurance stake you
+        DECLARE on the bid. Subjective-outcome offer categories -- TRANSFORMATION,
+        CREATIVE_CONTENT, ADVISORY, EXPERT_JUDGMENT, MARKET_RESEARCH,
+        QUALITATIVE_ANALYSIS, i.e. most real agent work -- require it to be at
+        least 5% of your bid price, or the bid is rejected with
+        `bid_insurance_stake_insufficient`.
+
+        It defaults to exactly that 5% floor, so a seller does not need to know
+        the offer's category to bid successfully. This is a DECLARED commitment
+        recorded on the Bid: no balance is locked or debited for it, so there is
+        no stake deposit to make and no stake tool to call. Pass an explicit
+        value to declare more; pass 0 to declare none (valid only on
+        non-subjective categories).
         """
         # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
@@ -780,6 +804,7 @@ class ThreadClient:
                 price_micro,
                 quoted_latency_ms,
                 quoted_price_micro=quoted_price_micro,
+                insurance_stake_micro=insurance_stake_micro,
             )
         )
 
@@ -790,6 +815,7 @@ class ThreadClient:
         quoted_latency_ms: int = 5000,
         *,
         quoted_price_micro: int | None = None,
+        insurance_stake_micro: int | None = None,
     ) -> dict[str, Any]:
         price = price_micro if price_micro is not None else quoted_price_micro
         if price is None:
@@ -797,10 +823,24 @@ class ThreadClient:
                 "post_bid: price_micro is required (or pass deprecated "
                 "alias quoted_price_micro=...)."
             )
+        # §13.2 field 11. Default to the subjective-outcome floor (5% of price) so a
+        # seller that does not know the offer's category still clears the gate. The
+        # stake is DECLARED, not locked -- nothing is debited -- so defaulting it costs
+        # the seller nothing and removes the hard wall a cold seller otherwise hits
+        # (bid_insurance_stake_insufficient with no discoverable remedy). It rides
+        # build_params so it is carried into the build_doc canonical the client SIGNS,
+        # not just the submit -- otherwise a keyless bid would sign a Bid without the
+        # field and be rejected regardless.
+        stake = (
+            insurance_stake_micro
+            if insurance_stake_micro is not None
+            else (int(price) * INSURANCE_STAKE_MIN_BPS_SUBJECTIVE) // 10_000
+        )
         build_params: dict[str, Any] = {
             "offer_id_hex": offer_id_hex,
             "price_micro": str(price),
             "quoted_latency_ms": quoted_latency_ms,
+            "insurance_stake_micro": str(stake),
         }
         signed = self._build_and_sign("thread.post_bid", build_params)
         bid_id_hex = signed["extra_ids"].get("bid_id_hex")

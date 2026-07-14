@@ -79,6 +79,17 @@ import {
 
 const SETTLEMENT_FEE_BPS = 100 as const;
 
+/**
+ * §13.2 field 11 / §13.9 — a Bid on a SUBJECTIVE-OUTCOME offer category (TRANSFORMATION,
+ * CREATIVE_CONTENT, ADVISORY, EXPERT_JUDGMENT, MARKET_RESEARCH, QUALITATIVE_ANALYSIS — i.e.
+ * most real agent work) must DECLARE `insurance_stake_micro` of at least this many bps of the
+ * bid price, or the gate rejects it (`bid_insurance_stake_insufficient`). The stake is a
+ * declared commitment recorded on the Bid: nothing is locked or debited, so there is no stake
+ * deposit to make. `postBid` defaults to exactly this floor so a seller that does not know the
+ * offer's category still clears the gate.
+ */
+const INSURANCE_STAKE_MIN_BPS_SUBJECTIVE = 500 as const; // 5%
+
 // COSE protected-header keys
 const COSE_HEADER_ALG = 1;
 const COSE_HEADER_KID = 4;
@@ -749,6 +760,21 @@ export class ThreadClient {
         /** @deprecated Pass `priceMicro` instead. */
         quotedPriceMicro?: bigint;
         quotedLatencyMs?: number;
+        /**
+         * §13.2 field 11 — the insurance stake you DECLARE on this bid.
+         *
+         * Subjective-outcome offer categories (TRANSFORMATION, CREATIVE_CONTENT, ADVISORY,
+         * EXPERT_JUDGMENT, MARKET_RESEARCH, QUALITATIVE_ANALYSIS — i.e. most real agent work)
+         * require it to be at least 5% of your bid price, or the bid is rejected with
+         * `bid_insurance_stake_insufficient`.
+         *
+         * Defaults to exactly that 5% floor, so a seller does not need to know the offer's
+         * category to bid successfully. This is a DECLARED commitment recorded on the Bid:
+         * no balance is locked or debited for it, so there is no stake deposit to make and
+         * no stake tool to call. Pass a larger value to declare more; pass 0n to declare
+         * none (valid only on non-subjective categories).
+         */
+        insuranceStakeMicro?: bigint;
     }): Promise<{ bidIdHex: string }> {
         // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.postBidOnce(args));
@@ -759,15 +785,27 @@ export class ThreadClient {
         priceMicro?: bigint;
         quotedPriceMicro?: bigint;
         quotedLatencyMs?: number;
+        insuranceStakeMicro?: bigint;
     }): Promise<{ bidIdHex: string }> {
         const price = args.priceMicro ?? args.quotedPriceMicro;
         if (price === undefined) {
             throw new ThreadError('postBid: priceMicro is required (or pass deprecated alias quotedPriceMicro)');
         }
+        // §13.2 field 11. Default to the subjective-outcome floor (5% of price) so a seller
+        // that does not know the offer's category still clears the gate. The stake is
+        // DECLARED, not locked — nothing is debited — so defaulting it costs the seller
+        // nothing and removes the hard wall a cold seller otherwise hits
+        // (bid_insurance_stake_insufficient, with no discoverable remedy). It rides
+        // buildParams so it is carried into the build_doc canonical the client SIGNS, not
+        // just the submit — otherwise a keyless bid would sign a Bid without the field and
+        // be rejected regardless.
+        const stake = args.insuranceStakeMicro
+            ?? (price * BigInt(INSURANCE_STAKE_MIN_BPS_SUBJECTIVE)) / 10_000n;
         const buildParams: Record<string, unknown> = {
             offer_id_hex: args.offerIdHex,
             price_micro: price.toString(),
             quoted_latency_ms: args.quotedLatencyMs ?? 5000,
+            insurance_stake_micro: stake.toString(),
         };
         const signed = await this.buildAndSign('thread.post_bid', buildParams);
         const bidIdHex = signed.extraIds['bid_id_hex'] as string;
