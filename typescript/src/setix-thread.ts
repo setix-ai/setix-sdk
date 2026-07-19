@@ -608,7 +608,7 @@ export class ThreadClient {
         return Buffer.from(envelope).toString('hex');
     }
 
-    async register(description: string): Promise<{ agentIdHex: string; setixCode: number; pubkeyHex: string }> {
+    async register(description: string): Promise<{ agentIdHex: string; setixCode: number; pubkeyHex: string; alreadyRegistered?: boolean }> {
         // Register this agent. Your key never leaves this process: the SDK
         // fetches a challenge, signs the challenge and the chain registration
         // transaction locally, and submits only the signatures.
@@ -616,6 +616,21 @@ export class ThreadClient {
         // Flow: scout (classify the description) -> request a challenge ->
         // sign the challenge and the chain registration transaction locally
         // -> submit the signatures.
+        //
+        // Idempotent: re-registering a key that already registered is a no-op —
+        // it returns the existing registration instead of resubmitting a chain
+        // registration transaction (which the chain rejects as a duplicate — a
+        // naive retry formerly hit an HTTP 500, since each call minted a fresh
+        // idempotency_key. Whip Audit-7). Re-construct the client with the same
+        // keyPath; loadMeta() restores agentIdHex and this short-circuits.
+        if (this.agentIdHex !== null) {
+            return {
+                agentIdHex: this.agentIdHex,
+                setixCode: this.setixCode ?? 0,
+                pubkeyHex: this.kp.pubkeyHex,
+                alreadyRegistered: true,
+            };
+        }
         let setixCode = 0;
         let capabilityProfileId = 'general';
         try {
@@ -693,6 +708,13 @@ export class ThreadClient {
 
     async postOffer(args: {
         maxPriceMicro: bigint;
+        /** The bespoke deliverable spec — instruction + acceptance criteria + any
+         *  input, as plain text. The seller reads it VERBATIM via query_offers and
+         *  it is HOW they learn what to deliver; the buyer's own model judges the
+         *  delivery against it. Omit only for a pure commodity want. Passing it is
+         *  strongly preferred to posting a job with no brief (Whip Audit-7: the
+         *  wrappers omitted it, so a cold buyer posted an offer with no description). */
+        inputData?: string;
         setixCode?: number;
     }): Promise<{ offerIdHex: string }> {
         // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
@@ -701,14 +723,30 @@ export class ThreadClient {
 
     private async postOfferOnce(args: {
         maxPriceMicro: bigint;
+        inputData?: string;
         setixCode?: number;
     }): Promise<{ offerIdHex: string }> {
-        const sc = args.setixCode ?? this.setixCode;
+        let sc: number | null = args.setixCode ?? null;
+        if (sc === null && args.inputData !== undefined) {
+            // Categorize the OFFER by its TASK, not the agent's register-scout
+            // category (Whip Audit-7 #3: register() classifies the AGENT — a buyer
+            // self-description scouts to a buyer category where no sellers watch; a
+            // buyer's offer must be classified by the literal deliverable spec so
+            // the right sellers find it). inputData IS that literal spec. Pass an
+            // explicit setixCode to override; best-effort — falls back on failure.
+            try {
+                const { result: scoutRes } = await this.invoke('thread.scout', { nl_self_description: args.inputData });
+                const scouted = Number((scoutRes as { setix_code?: number | string }).setix_code ?? 0);
+                if (scouted) sc = scouted;
+            } catch { /* scout best-effort; fall through to registered setixCode */ }
+        }
+        if (sc === null) sc = this.setixCode;
         if (sc === null) throw new ThreadError('Call register() first or pass setixCode');
         const buildParams: Record<string, unknown> = {
             max_price_micro: args.maxPriceMicro.toString(),
             setix_code: sc,
         };
+        if (args.inputData !== undefined) buildParams['input_data'] = args.inputData;
         const signed = await this.buildAndSign('thread.post_offer', buildParams);
         const offerIdHex = signed.extraIds['offer_id_hex'] as string;
         if (!offerIdHex) throw new ThreadError('build_doc did not return offer_id_hex');
@@ -1834,7 +1872,9 @@ export async function buyOnce(opts: {
 }): Promise<{ settlementIdHex: string; releasedMicro: bigint; feeMicro: bigint }> {
     const client = new ThreadClient({ bridgeUrl: opts.bridgeUrl, ...(opts.keyPath !== undefined ? { keyPath: opts.keyPath } : {}) });
     if (client.setixCode === null) await client.register(opts.description);
-    const offer = await client.postOffer({ maxPriceMicro: opts.maxPriceMicro });
+    // description IS the task — attach it as the offer's deliverable spec so
+    // sellers see WHAT to deliver (Whip Audit-7: the wrapper posted no brief).
+    const offer = await client.postOffer({ maxPriceMicro: opts.maxPriceMicro, inputData: opts.description });
     const bids = await client.waitForBids(offer.offerIdHex, { timeoutMs: opts.bidTimeoutMs ?? 60_000 });
     if (bids.length === 0) throw new ThreadError('no bids arrived in time');
     const chosen = bids.reduce((a, b) =>
@@ -1895,7 +1935,8 @@ export async function buyerLoop(opts: {
 }): Promise<Record<string, unknown>> {
     const client = new ThreadClient({ bridgeUrl: opts.bridgeUrl, ...(opts.keyPath !== undefined ? { keyPath: opts.keyPath } : {}) });
     if (client.setixCode === null) await client.register(opts.description);
-    const offer = await client.postOffer({ maxPriceMicro: opts.maxPriceMicro ?? 5000n });
+    // description IS the task — attach it as the offer's deliverable spec (Whip Audit-7).
+    const offer = await client.postOffer({ maxPriceMicro: opts.maxPriceMicro ?? 5000n, inputData: opts.description });
     const bids = await client.waitForBids(offer.offerIdHex, { timeoutMs: opts.bidTimeoutMs ?? 60_000 });
     if (bids.length === 0) throw new ThreadError('buyerLoop: no bids arrived in time');
     const chosen = bids.reduce((a, b) =>
@@ -1999,7 +2040,8 @@ export async function autoTrade(opts: {
 
     if (role === 'buyer') {
         const maxPriceMicro = opts.maxPriceMicro ?? 5000n;
-        const offer = await client.postOffer({ maxPriceMicro });
+        // description IS the task — attach it as the offer's deliverable spec (Whip Audit-7).
+        const offer = await client.postOffer({ maxPriceMicro, inputData: opts.description });
         const bids = await client.waitForBids(offer.offerIdHex, {
             timeoutMs: opts.bidTimeoutMs ?? 30_000,
         });

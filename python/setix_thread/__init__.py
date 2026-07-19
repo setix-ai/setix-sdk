@@ -612,7 +612,24 @@ class ThreadClient:
         Flow: scout (classify the description) -> request a challenge ->
         sign the challenge and the chain registration transaction locally
         -> submit the signatures.
+
+        Idempotent: re-registering a key that already registered is a no-op —
+        it returns the existing registration instead of resubmitting a chain
+        registration transaction. (Each call formerly minted a fresh
+        idempotency_key, so a naive retry resubmitted the register tx and the
+        chain rejected the duplicate — a cold agent testing "is register safe to
+        retry?" hit an HTTP 500. Whip Audit-7.) The safe re-call pattern is to
+        just construct the client with the same key_path; `_load_meta` restores
+        agent_id_hex and this short-circuit returns it.
         """
+        if self.agent_id_hex is not None:
+            return {
+                "registered": True,
+                "already_registered": True,
+                "pubkey_hex": self.kp.pubkey_hex,
+                "agent_id_hex": self.agent_id_hex,
+                "setix_code": self.setix_code,
+            }
         setix_code = 0
         capability_profile_id = "general"
         try:
@@ -705,26 +722,55 @@ class ThreadClient:
     def post_offer(
         self,
         max_price_micro: int,
+        input_data: str | None = None,
         setix_code: int | None = None,
     ) -> dict[str, Any]:
-        """Post a buyer offer."""
+        """Post a buyer offer (a "want").
+
+        input_data is the bespoke deliverable spec — instruction + acceptance
+        criteria + any input, as plain text. The seller reads it VERBATIM via
+        thread.query_offers and it is HOW they learn what to deliver; the buyer's
+        own model judges the delivery against it. Omit only for a pure commodity
+        want (setix_code + price alone). Passing it here is strongly preferred to
+        posting a job with no brief. (Whip Audit-7: the convenience wrappers used
+        to omit it, so a cold buyer posted an offer with no description at all.)
+        """
         # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
-            lambda: self._post_offer_once(max_price_micro, setix_code)
+            lambda: self._post_offer_once(max_price_micro, input_data, setix_code)
         )
 
     def _post_offer_once(
         self,
         max_price_micro: int,
+        input_data: str | None = None,
         setix_code: int | None = None,
     ) -> dict[str, Any]:
-        sc = setix_code if setix_code is not None else self.setix_code
+        sc = setix_code
+        if sc is None and input_data is not None:
+            # Categorize the OFFER by its TASK, not the agent's register-scout
+            # category (Whip Audit-7 #3: register() classifies the AGENT — a buyer
+            # self-description scouts to a buyer category where no sellers watch; a
+            # buyer's offer must be classified by the literal deliverable spec so
+            # the right sellers find it). input_data IS that literal spec. Pass an
+            # explicit setix_code to override; best-effort — falls back on failure.
+            try:
+                scout, _ = self._invoke("thread.scout", {"nl_self_description": input_data})
+                scouted = int(scout.get("setix_code", 0))
+                if scouted:
+                    sc = scouted
+            except (BridgeError, ThreadError):
+                pass
+        if sc is None:
+            sc = self.setix_code
         if sc is None:
             raise ThreadError("Call register() first or pass setix_code explicitly")
         build_params: dict[str, Any] = {
             "max_price_micro": str(max_price_micro),
             "setix_code": sc,
         }
+        if input_data is not None:
+            build_params["input_data"] = input_data
         signed = self._build_and_sign("thread.post_offer", build_params)
         offer_id_hex = signed["extra_ids"].get("offer_id_hex")
         if not offer_id_hex:
@@ -753,6 +799,7 @@ class ThreadClient:
             "offer_id_hex": offer_id_hex,
             "setix_code": sc,
             "max_price_micro": str(max_price_micro),
+            "input_data": input_data,
         }
 
     def query_offers(
@@ -1883,7 +1930,9 @@ def buy_once(
     client = ThreadClient(bridge_url, key_path=key_path)
     if client.setix_code is None:
         client.register(description)
-    offer = client.post_offer(max_price_micro=max_price_micro)
+    # description IS the task here — attach it as the offer's deliverable spec so
+    # sellers see WHAT to deliver (Whip Audit-7: the wrapper posted no brief).
+    offer = client.post_offer(max_price_micro=max_price_micro, input_data=description)
     bids = client.wait_for_bids(offer["offer_id_hex"], timeout_sec=bid_timeout_sec)
     if not bids:
         raise ThreadError("no bids arrived in time")
@@ -1957,7 +2006,9 @@ def buyer_loop(
     client = ThreadClient(bridge_url, key_path=key_path)
     if client.setix_code is None:
         client.register(description)
-    offer = client.post_offer(max_price_micro=max_price_micro)
+    # description IS the task here — attach it as the offer's deliverable spec so
+    # sellers see WHAT to deliver (Whip Audit-7: the wrapper posted no brief).
+    offer = client.post_offer(max_price_micro=max_price_micro, input_data=description)
     bids = client.wait_for_bids(offer["offer_id_hex"], timeout_sec=bid_timeout_sec)
     if not bids:
         raise ThreadError("buyer_loop: no bids arrived in time")
