@@ -328,9 +328,34 @@ function httpPost(target: string, path: string, body: unknown): Promise<HttpResu
 
 // ---- main client ----------------------------------------------------------
 
+// Nonce-mismatch retry defaults. The chain admits a bounded number of
+// transactions per agent per block (~1.9s cadence), so a concurrent burst of
+// writes from one identity gets some rejected with the RETRYABLE
+// `chain_nonce_mismatch` token (chain code 7). A bounded
+// exponential-backoff-with-full-jitter loop (base delay ~1 block) clears the
+// burst; see retryOnNonceMismatch.
+const RETRY_MAX_ATTEMPTS_DEFAULT = 8;
+const RETRY_BASE_DELAY_S_DEFAULT = 1.9;
+/** Hard wall-clock budget across all nonce-mismatch retries of one write. */
+const RETRY_TOTAL_TIME_CAP_MS = 30_000;
+
 export interface ThreadClientOptions {
     bridgeUrl: string;
     keyPath?: string;
+    /**
+     * Total attempts (initial + retries) per chain write on the RETRYABLE
+     * `chain_nonce_mismatch` reject (chain code 7). Default 8. Set 2 for the
+     * legacy single-retry behavior; 1 disables retries entirely. Only the
+     * nonce-mismatch reject is retried — it is safe by construction (the tx
+     * was rejected, nothing committed); every other failure surfaces on the
+     * first attempt.
+     */
+    retryMaxAttempts?: number;
+    /**
+     * Base delay in seconds for the nonce-mismatch retry backoff
+     * (exponential + full jitter). Default 1.9 — about one chain block.
+     */
+    retryBaseDelayS?: number;
 }
 
 /** The typed result union of `thread.query_escrow_by_bid` — the found
@@ -349,6 +374,10 @@ export class ThreadClient {
     readonly bridgeUrl: string;
     readonly keyPath: string;
     readonly kp: Keypair;
+    /** See ThreadClientOptions.retryMaxAttempts. */
+    readonly retryMaxAttempts: number;
+    /** See ThreadClientOptions.retryBaseDelayS. */
+    readonly retryBaseDelayS: number;
     setixCode: number | null = null;
     agentIdHex: string | null = null;
 
@@ -356,6 +385,8 @@ export class ThreadClient {
         const o = typeof opts === 'string' ? { bridgeUrl: opts } : opts;
         this.bridgeUrl = o.bridgeUrl.replace(/\/$/, '');
         this.keyPath = o.keyPath ?? defaultKeyPath();
+        this.retryMaxAttempts = Math.max(1, Math.floor(o.retryMaxAttempts ?? RETRY_MAX_ATTEMPTS_DEFAULT));
+        this.retryBaseDelayS = o.retryBaseDelayS ?? RETRY_BASE_DELAY_S_DEFAULT;
         this.kp = loadOrCreateKeypair(this.keyPath);
         this.loadMeta();
     }
@@ -423,25 +454,61 @@ export class ThreadClient {
         return result;
     }
 
-    /** True when e is the chain's code-7 nonce-mismatch reject. */
+    /** True when e is the chain's code-7 nonce-mismatch reject (the
+     *  `chain_nonce_mismatch` token). ONLY this reject is retried: it is safe
+     *  by construction — the tx was rejected, nothing committed. Deterministic
+     *  contract rejects (any other token/code) must NEVER be retried. */
     private static isNonceMismatch(e: unknown): boolean {
         return e instanceof ChainWriteError
-            && (e.chainCode === 7 || e.log.includes('nonce mismatch'));
+            && (e.chainCode === 7
+                || e.errorToken === 'chain_nonce_mismatch'
+                || e.log.includes('nonce mismatch'));
+    }
+
+    /** Sleep helper for the nonce-retry backoff. Own method so tests can stub it. */
+    private retrySleep(ms: number): Promise<void> {
+        return new Promise<void>((r) => setTimeout(r, ms));
+    }
+
+    /** Clock source for the retry total-time cap. Own method so tests can stub it. */
+    private retryNow(): number {
+        return Date.now();
     }
 
     /**
-     * Run a chain-write flow, retrying ONCE on the chain's code-7 nonce
-     * mismatch. By the time the retry runs, checkChainResult has re-seeded
-     * the local nonce allocator from the chain's expected value, and the
-     * re-run's fresh thread.build_doc issues a new doc_id (replay-safe).
-     * Every other failure surfaces unchanged.
+     * Run a chain-write flow, retrying on the chain's code-7 nonce mismatch
+     * (`chain_nonce_mismatch`) — and ONLY on that reject — with exponential
+     * backoff + full jitter. The chain admits a bounded number of transactions
+     * per agent per block, so a concurrent burst of writes from one identity
+     * gets some rejected with this RETRYABLE token; backing off ~1 block and
+     * re-deriving the nonce clears the burst. Bounds: `retryMaxAttempts` total
+     * attempts (default 8; 2 = the legacy single retry) and a
+     * RETRY_TOTAL_TIME_CAP_MS wall-clock budget. On exhaustion the LAST
+     * ChainWriteError is rethrown unchanged.
+     *
+     * By the time each retry runs, checkChainResult has re-seeded the local
+     * nonce allocator from the chain's expected value (or invalidated it, so
+     * the next allocation re-fetches), and the re-run's fresh thread.build_doc
+     * issues a new doc_id and re-signs (replay-safe). Every other failure
+     * surfaces unchanged on the first attempt.
      */
     private async retryOnNonceMismatch<T>(fn: () => Promise<T>): Promise<T> {
-        try {
-            return await fn();
-        } catch (e) {
-            if (!ThreadClient.isNonceMismatch(e)) throw e;
-            return fn();
+        const start = this.retryNow();
+        for (let attempt = 1; ; attempt++) {
+            try {
+                return await fn();
+            } catch (e) {
+                if (!ThreadClient.isNonceMismatch(e)) throw e;
+                const elapsedMs = this.retryNow() - start;
+                if (attempt >= this.retryMaxAttempts || elapsedMs >= RETRY_TOTAL_TIME_CAP_MS) throw e;
+                // Exponential backoff with FULL jitter: uniform in
+                // [0, base × 2^(attempt-1)], capped by the remaining
+                // wall-clock budget. Jitter desynchronizes concurrent
+                // writers so retries spread across distinct blocks.
+                const expMs = this.retryBaseDelayS * 1000 * 2 ** (attempt - 1);
+                const capMs = Math.min(expMs, RETRY_TOTAL_TIME_CAP_MS - elapsedMs);
+                await this.retrySleep(Math.random() * capMs);
+            }
         }
     }
 
@@ -514,7 +581,8 @@ export class ThreadClient {
      * under a promise-chain mutex: N parallel writes get N strictly
      * consecutive nonces from that single fetch instead of N copies of the
      * same nonce (the chain rejects all but one with code 7). A chain
-     * nonce-mismatch reject re-seeds the counter — see checkChainResult.
+     * nonce-mismatch reject re-seeds the counter (see checkChainResult) and
+     * the write is retried with bounded backoff (see retryOnNonceMismatch).
      */
     private async getNextChainNonce(): Promise<bigint> {
         const allocation = this._nonceLock.then(async () => {
@@ -717,7 +785,7 @@ export class ThreadClient {
         inputData?: string;
         setixCode?: number;
     }): Promise<{ offerIdHex: string }> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.postOfferOnce(args));
     }
 
@@ -814,7 +882,7 @@ export class ThreadClient {
          */
         insuranceStakeMicro?: bigint;
     }): Promise<{ bidIdHex: string }> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.postBidOnce(args));
     }
 
@@ -900,8 +968,9 @@ export class ThreadClient {
         const retries = args.raceRetries ?? 3;
         for (let attempt = 0; ; attempt++) {
             try {
-                // Retry ONCE on the chain's code-7 nonce mismatch (orthogonal
-                // to the accept_bid_chain_race loop — see retryOnNonceMismatch).
+                // Bounded backoff retry on the chain's code-7 nonce mismatch
+                // (orthogonal to the accept_bid_chain_race loop — see
+                // retryOnNonceMismatch).
                 return await this.retryOnNonceMismatch(() => this.acceptBidOnce(args));
             } catch (e) {
                 const disposition = (e instanceof BridgeError || e instanceof ChainWriteError)
@@ -1125,7 +1194,7 @@ export class ThreadClient {
         // opaquely; it never sees plaintext. Omit all three for a normal delivery.
         outputUri?: string; outputHashHex?: string; outputKeyWrapHex?: string;
     }): Promise<{ deliveryIdHex: string; outputHashHex: string }> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.submitDeliveryOnce(args));
     }
 
@@ -1283,7 +1352,7 @@ export class ThreadClient {
         evidenceHashHex?: string;
         evidenceBondMicro?: bigint;
     }): Promise<{ disputeIdHex: string; status: string; assignedOracleHex: string | null }> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.fileDisputeOnce(args));
     }
 
@@ -1400,7 +1469,7 @@ export class ThreadClient {
         /** Optional sha256 (hex) of new appeal evidence. */
         evidenceHashHex?: string;
     }): Promise<{ status: string; appealDisputeIdHex: string; appealBondMicro: string | null }> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.fileAppealOnce(args));
     }
 
@@ -1574,7 +1643,7 @@ export class ThreadClient {
         deliveryIdHex?: string;
         acceptanceIdHex?: string;
     }): Promise<Record<string, unknown>> {
-        // Retry ONCE on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
+        // Bounded backoff retry on the chain's code-7 nonce mismatch (see retryOnNonceMismatch).
         return this.retryOnNonceMismatch(() => this.settleHlOnce(opts));
     }
 

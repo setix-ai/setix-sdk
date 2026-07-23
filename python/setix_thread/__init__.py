@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import threading
@@ -97,6 +98,19 @@ INSURANCE_STAKE_MIN_BPS_SUBJECTIVE = 500  # 5%
 # Cold-LLM Run 4 finding RUN4.S1: stock urllib's default UA ("Python-urllib/X.Y")
 # is blocked by Cloudflare WAF rule 1010. Send a real UA on every request.
 _SETIX_SDK_USER_AGENT = "setix-thread-sdk/0.1 (python)"
+
+# SDK package version (setix-thread on PyPI). Decoupled from THREAD_VERSION
+# below — see the INDEPENDENT VERSION STREAMS note.
+__version__ = "0.0.12"
+
+# Nonce-mismatch retry (Zilk Audit-6 A6-01): the chain admits ONE tx per agent
+# per block (~1.85s cadence), so a concurrent same-identity write burst lands
+# one write first-pass and rejects the rest with the RETRYABLE
+# chain_nonce_mismatch (chain code 7). A single immediate retry cannot clear a
+# burst — each surviving write needs its own block. The write path retries
+# with exponential backoff + full jitter, bounded by the client's
+# retry_max_attempts / retry_base_delay_s config and this total-elapsed cap.
+_NONCE_RETRY_TOTAL_CAP_S = 30.0
 
 # COSE protected-header keys
 COSE_HEADER_ALG = 1
@@ -363,9 +377,17 @@ class ThreadClient:
         self,
         bridge_url: str,
         key_path: str | None = None,
+        *,
+        retry_max_attempts: int = 8,
+        retry_base_delay_s: float = 1.9,
     ):
         self.bridge_url = bridge_url.rstrip("/")
         self.key_path = key_path or os.path.expanduser("~/.thread/agent.key")
+        # Nonce-mismatch retry config (Zilk A6-01) — see _retry_on_nonce_mismatch.
+        # retry_max_attempts counts TOTAL attempts (initial call included);
+        # retry_base_delay_s is the backoff base, ~1 chain block.
+        self.retry_max_attempts = max(1, int(retry_max_attempts))
+        self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
         self.kp = _load_or_create_keypair(self.key_path)
         self.setix_code: int | None = None
         self.agent_id_hex: str | None = None
@@ -445,17 +467,48 @@ class ThreadClient:
         )
 
     def _retry_on_nonce_mismatch(self, fn):
-        """Run a chain-write flow, retrying ONCE on the chain's code-7 nonce
-        mismatch. By the time the retry runs, _check_chain_result has
-        re-seeded the local nonce allocator from the chain's expected value,
-        and the re-run's fresh thread.build_doc issues a new doc_id
-        (replay-safe). Every other failure surfaces unchanged."""
-        try:
-            return fn()
-        except ChainWriteError as e:
-            if not self._is_nonce_mismatch(e):
-                raise
-            return fn()
+        """Run a chain-write flow, retrying on the chain's code-7
+        ``chain_nonce_mismatch`` reject with exponential backoff + full jitter
+        (Zilk Audit-6 A6-01).
+
+        The chain admits ONE tx per agent per block (~1.85s cadence), so a
+        concurrent same-identity write burst lands one write first-pass and
+        rejects the rest with code 7. That reject is retryable BY
+        CONSTRUCTION: the tx was rejected, nothing committed. By the time
+        each retry runs, _check_chain_result has re-seeded the local nonce
+        allocator from the chain's expected value; the re-run derives a fresh
+        nonce, gets a fresh thread.build_doc doc_id (replay-safe), re-signs
+        and resubmits.
+
+        Attempt k (1-based) sleeps ``uniform(0, retry_base_delay_s *
+        2**(k-1))`` before attempt k+1 — full jitter off a ~1-block base
+        (default 1.9s) — bounded by ``retry_max_attempts`` TOTAL attempts
+        (default 8) and a ~30s total-elapsed cap. ``retry_max_attempts=2,
+        retry_base_delay_s=0.0`` is the degenerate pre-A6-01
+        single-immediate-retry config. On exhaustion the LAST ChainWriteError
+        is raised unchanged (same type, last chain result).
+
+        Every other failure — including deterministic contract rejects like
+        ``bid_already_accepted`` — surfaces unchanged after the first attempt
+        and is NEVER retried here."""
+        start = time.monotonic()
+        attempt = 1
+        while True:
+            try:
+                return fn()
+            except ChainWriteError as e:
+                if not self._is_nonce_mismatch(e):
+                    raise
+                if attempt >= self.retry_max_attempts:
+                    raise
+                remaining = _NONCE_RETRY_TOTAL_CAP_S - (time.monotonic() - start)
+                if remaining <= 0:
+                    raise
+                delay = random.uniform(
+                    0.0, self.retry_base_delay_s * (2 ** (attempt - 1))
+                )
+                time.sleep(min(delay, remaining))
+                attempt += 1
 
     def _fresh_slot(self) -> int:
         _, slot = self._invoke("thread.platform_health", {})
@@ -735,7 +788,7 @@ class ThreadClient:
         posting a job with no brief. (Whip Audit-7: the convenience wrappers used
         to omit it, so a cold buyer posted an offer with no description at all.)
         """
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._post_offer_once(max_price_micro, input_data, setix_code)
         )
@@ -844,7 +897,7 @@ class ThreadClient:
         value to declare more; pass 0 to declare none (valid only on
         non-subjective categories).
         """
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._post_bid_once(
                 offer_id_hex,
@@ -963,8 +1016,9 @@ class ThreadClient:
         attempt = 0
         while True:
             try:
-                # Retry ONCE on the chain's code-7 nonce mismatch (orthogonal
-                # to the accept_bid_chain_race loop — see _retry_on_nonce_mismatch).
+                # Bounded backoff-retry on the chain's code-7 nonce mismatch
+                # (orthogonal to the accept_bid_chain_race loop — see
+                # _retry_on_nonce_mismatch).
                 return self._retry_on_nonce_mismatch(
                     lambda: self._accept_bid_once(
                         offer_id_hex, bid_id_hex, seller_id_hex, agreed_price_micro
@@ -1180,7 +1234,7 @@ class ThreadClient:
     def submit_delivery(
         self, acceptance_id_hex: str, buyer_id_hex: str, output: str
     ) -> dict[str, Any]:
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._submit_delivery_once(acceptance_id_hex, buyer_id_hex, output)
         )
@@ -1357,7 +1411,7 @@ class ThreadClient:
         the Dispute document internally.
         Returns {dispute_id_hex, status, assigned_oracle_hex}.
         """
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._file_dispute_once(
                 delivery_id_hex, reason, evidence_uri, evidence_hash_hex,
@@ -1472,7 +1526,7 @@ class ThreadClient:
 
         Returns {status, appeal_dispute_id_hex, appeal_bond_micro, ...}.
         """
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._file_appeal_once(
                 parent_dispute_id_hex, reason, evidence_hash_hex
@@ -1631,7 +1685,7 @@ class ThreadClient:
         output_hash via query_escrow + poll_delivery; the bridge canonicalises
         the Settlement document; the SDK signs it locally and also signs the
         chain Settle transaction locally."""
-        # Retry ONCE on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
+        # Bounded backoff-retry on the chain's code-7 nonce mismatch (see _retry_on_nonce_mismatch).
         return self._retry_on_nonce_mismatch(
             lambda: self._settle_hl_once(delivery_id_hex, acceptance_id_hex)
         )
